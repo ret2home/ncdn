@@ -7,13 +7,15 @@ import (
 
 func (p *PoPInfo) FormatWebUIJson() []byte {
 	in := struct {
-		Id         string `json:"id"`
-		Ip4        string `json:"ip4"`
-		UIPopupCSS string `json:"ui_popup_css"`
+		Id          string `json:"id"`
+		Ip4         string `json:"ip4"`
+		UIPopupCSS  string `json:"ui_popup_css"`
+		CountryCode string `json:"cc"`
 	}{
-		Id:         p.Id,
-		Ip4:        p.Ip4.String(),
-		UIPopupCSS: p.UIPopupCSS,
+		Id:          p.Id,
+		Ip4:         p.Ip4.String(),
+		UIPopupCSS:  p.UIPopupCSS,
+		CountryCode: p.CountryCode,
 	}
 	bs, err := json.Marshal(&in)
 	if err != nil {

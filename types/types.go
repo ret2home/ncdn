@@ -14,6 +14,8 @@ type PoPInfo struct {
 
 	// [webui] CSS of the region popup
 	UIPopupCSS string
+
+	CountryCode string
 }
 
 type RegionInfo struct {
