@@ -217,5 +217,26 @@ func (c *GslbCore) Query(srcIP netip.Addr) []netip.Addr {
 	defer c.mu.Unlock()
 
 	// FIXME(student): Implement your own query logic
+
+	for _, r := range c.regions {
+		matched := false
+		for _, prip := range r.info.Prefixes {
+			if prip.Contains(srcIP) {
+				matched = true
+			}
+		}
+		if matched {
+			mn := 20000000.
+			mn_idx := 0
+			for j, tm := range r.popLatency {
+				if mn > tm {
+					mn = tm
+					mn_idx = j
+				}
+			}
+			return []netip.Addr{c.cfg.Pops[mn_idx].Ip4}
+		}
+	}
+
 	return []netip.Addr{c.cfg.Pops[0].Ip4}
 }
