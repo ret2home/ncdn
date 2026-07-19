@@ -2,6 +2,7 @@ package corednsplugin
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net"
 	"net/netip"
@@ -11,11 +12,17 @@ import (
 	"github.com/coredns/coredns/plugin"
 	clog "github.com/coredns/coredns/plugin/pkg/log"
 
+	countryinfo "github.com/yzp0n/ncdn/gslb/country_info"
 	"github.com/yzp0n/ncdn/gslb/gslbcore"
 	"github.com/yzp0n/ncdn/types"
 )
 
 const PluginName = "ncdn_gslb"
+
+var (
+	cidrdb  = flag.String("cidrdb", "./secrets/country", "cidr db files")
+	latlong = flag.String("latlong", "./secrets/cc-codes.json", "country code")
+)
 
 var log = clog.NewWithPlugin(PluginName)
 
@@ -102,6 +109,12 @@ func setup(c *caddy.Controller) error {
 						}
 						pop.UIPopupCSS = c.Val()
 
+					case "cc":
+						if !c.NextArg() {
+							return c.ArgErr()
+						}
+						pop.CountryCode = c.Val()
+
 					case "}":
 						break POP_LOOP
 
@@ -176,6 +189,18 @@ func setup(c *caddy.Controller) error {
 	if nsA == nil {
 		return fmt.Errorf("ns_a_addr is required.")
 	}
+
+	trie, err := ConstructTrieFromDB(*cidrdb)
+	if err != nil {
+		return fmt.Errorf("failed to load CIDR DB")
+	}
+	ccfg.CidrTrie = trie
+
+	countrymap, err := countryinfo.MakeMap(*latlong)
+	if err != nil {
+		return fmt.Errorf("failed to load country map")
+	}
+	ccfg.CountryInfoMap = countrymap
 
 	core := gslbcore.New(&ccfg)
 

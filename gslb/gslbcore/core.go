@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"net/netip"
 	"sync"
 	"time"
 
+	cidrtrie "github.com/yzp0n/ncdn/gslb/cidr_trie"
+	countryinfo "github.com/yzp0n/ncdn/gslb/country_info"
 	"github.com/yzp0n/ncdn/types"
 )
 
@@ -31,6 +34,8 @@ type Config struct {
 
 	FetchPoPStatus      FetchPoPStatusFunc
 	MakeLatencyMeasurer MakeLatencyMeasurerFunc
+	CidrTrie            *cidrtrie.CidrTrie
+	CountryInfoMap      map[string]countryinfo.LatLon
 }
 
 type RegionState struct {
@@ -217,5 +222,73 @@ func (c *GslbCore) Query(srcIP netip.Addr) []netip.Addr {
 	defer c.mu.Unlock()
 
 	// FIXME(student): Implement your own query logic
-	return []netip.Addr{c.cfg.Pops[0].Ip4}
+
+	for _, r := range c.regions {
+		matched := false
+		for _, prip := range r.info.Prefixes {
+			if prip.Contains(srcIP) {
+				matched = true
+			}
+		}
+		if matched {
+			mn := 20000000.
+			mn_idx := 0
+			for j, tm := range r.popLatency {
+				slog.Info("cc", slog.String("cc", c.cfg.Pops[j].CountryCode))
+				if mn > tm {
+					mn = tm
+					mn_idx = j
+				}
+			}
+			return []netip.Addr{c.cfg.Pops[mn_idx].Ip4}
+		}
+	}
+	cc := c.cfg.CidrTrie.Search(srcIP)
+
+	if cc == "" {
+		return []netip.Addr{c.cfg.Pops[0].Ip4}
+	}
+	if _, ok := c.cfg.CountryInfoMap[cc]; !ok {
+		return []netip.Addr{c.cfg.Pops[0].Ip4}
+	}
+
+	latlong := c.cfg.CountryInfoMap[cc]
+
+	minimumDistance := 40000.
+	nearestPopId := 0
+	for i, pop := range c.cfg.Pops {
+		if c.popstate[i].Error != "" {
+			continue
+		}
+		pop_latlong := c.cfg.CountryInfoMap[pop.CountryCode]
+		dist := DistanceKm(latlong.Lat, latlong.Lon, pop_latlong.Lat, pop_latlong.Lon)
+		if minimumDistance > dist {
+			minimumDistance = dist
+			nearestPopId = i
+		}
+	}
+
+	return []netip.Addr{c.cfg.Pops[nearestPopId].Ip4}
+}
+
+func DistanceKm(lat1, lon1, lat2, lon2 float64) float64 {
+	toRad := func(deg float64) float64 {
+		return deg * math.Pi / 180
+	}
+
+	lat1Rad := toRad(lat1)
+	lon1Rad := toRad(lon1)
+	lat2Rad := toRad(lat2)
+	lon2Rad := toRad(lon2)
+
+	dLat := lat2Rad - lat1Rad
+	dLon := lon2Rad - lon1Rad
+
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1Rad)*math.Cos(lat2Rad)*
+			math.Sin(dLon/2)*math.Sin(dLon/2)
+
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	const earthRadiusKm = 6371.0
+	return earthRadiusKm * c
 }
