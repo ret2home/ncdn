@@ -198,14 +198,14 @@ int lb_main(struct xdp_md* ctx) {
   struct tcphdr* tcp = (struct tcphdr*)(ip + 1);
 
   uint32_t key = flow_to_slot(ip->saddr, tcp->source);
-  debugk("incoming packet: ip=%pI4 port=%u", &ip->saddr, ntohs(tcp->source));
+  debugk("incoming packet: ip=%pI4 port=%u key=%u", &ip->saddr, ntohs(tcp->source),key);
 
   uint32_t *dest_idx = bpf_map_lookup_elem(&slots_map, &key);
   if(!dest_idx){
     bpf_printk("ASSERTION FAILURE: no slot entry for %d", key);
     EXIT(XDP_DROP);
   }
-  debugk("dest_idx=%d", dest_idx);
+  debugk("dest_idx=%u", *dest_idx);
   struct destination_entry* dest = bpf_map_lookup_elem(&destinations_map, dest_idx);
   if (!dest) {
     bpf_printk("ASSERTION FAILURE: no dest entry for %d", dest_idx);

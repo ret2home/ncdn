@@ -159,6 +159,7 @@ func (lb *L4LB) Sync() error {
 		destIdForSlots[i] = selectPop(lb.backendStatus, uint32(i))
 	}
 
+	fmt.Printf("changed! %v\n", lb.backendStatus)
 	fmt.Printf("update slots! %v\n", destIdForSlots[:8])
 
 	_, err = lb.bindings.SlotsArray.BatchUpdate(slotIds, destIdForSlots, &ebpf.BatchOptions{})
