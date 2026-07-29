@@ -155,7 +155,7 @@ func (e DestinationEntry) String() string {
 
 type DestinationEntries []DestinationEntry
 
-const DestinationEntrySize = 10
+const DestinationEntrySize = 11
 
 func (es DestinationEntries) MarshalBinary() ([]byte, error) {
 	buf := make([]byte, len(es)*DestinationEntrySize)
@@ -171,6 +171,9 @@ func (es DestinationEntries) MarshalBinary() ([]byte, error) {
 		}
 		copy(bs[0:6], e.HardwareAddr)
 		bs = bs[6:]
+
+		copy(bs[0:1], []uint8{e.IsAlive})
+		bs = bs[1:]
 	}
 
 	return buf, nil

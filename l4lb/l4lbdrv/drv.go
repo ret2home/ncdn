@@ -229,7 +229,6 @@ func NewBackendStatus(status int, result bool) int {
 func (lb *L4LB) DoHealthCheck() bool {
 	lens := len(lb.cfg.Dests)
 	changed := false
-	fmt.Printf("healthcheck...")
 
 	var wg sync.WaitGroup
 	wg.Add(lens - 1)
@@ -252,6 +251,5 @@ func (lb *L4LB) DoHealthCheck() bool {
 		}(i)
 	}
 	wg.Wait()
-	fmt.Printf("complete!")
 	return changed
 }

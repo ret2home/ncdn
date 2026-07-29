@@ -97,7 +97,7 @@ struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, CONN_CACHE_SIZE);
   __type(key, struct conn_cache_entry);
-  __type(value, uint16_t);
+  __type(value, uint32_t);
 } conn_cache SEC(".maps");
 
 #if DEBUG_LB_MAIN
@@ -211,7 +211,7 @@ int lb_main(struct xdp_md* ctx) {
 
   struct tcphdr* tcp = (struct tcphdr*)(ip + 1);
 
-  debugk("incoming packet: ip=%pI4 port=%u key=%u", &ip->saddr, ntohs(tcp->source),key);
+  debugk("incoming packet: ip=%pI4 port=%u", &ip->saddr, ntohs(tcp->source));
 
   struct conn_cache_entry cache_key;
   cache_key.ip_address=ip->saddr;
@@ -225,7 +225,12 @@ int lb_main(struct xdp_md* ctx) {
     dest = bpf_map_lookup_elem(&destinations_map, dest_idx);
     if(dest){
       valid_cache=dest->is_alive;
+      debugk("cache found! dest_idx=%u alive=%u", *dest_idx, valid_cache);
+    }else{
+      debugk("what happened??????????????????????");
     }
+  }else{
+      debugk("cache not found!");
   }
 
   if(!valid_cache){
@@ -236,7 +241,7 @@ int lb_main(struct xdp_md* ctx) {
       bpf_printk("ASSERTION FAILURE: no slot entry for %d", key);
       EXIT(XDP_DROP);
     }
-    debugk("cache miss! dest_idx=%u", *dest_idx);
+    debugk("invalid cache! new dest_idx=%u key=%u", *dest_idx, key);
 
     bpf_map_update_elem(&conn_cache, &cache_key, dest_idx, 0);
 
@@ -245,6 +250,10 @@ int lb_main(struct xdp_md* ctx) {
       bpf_printk("ASSERTION FAILURE: no dest entry for %d", dest_idx);
       EXIT(XDP_DROP);
     }
+  }
+  if (!dest) {
+    bpf_printk("ASSERTION FAILURE: no dest entry for %d", dest_idx);
+    EXIT(XDP_DROP);
   }
 
   debugk("dest ip=%pI4", &dest->ip_address);
@@ -306,6 +315,7 @@ int lb_main(struct xdp_md* ctx) {
       EXIT(XDP_DROP);
     }
   }
+  debugk("reached!!!!!\n");
 
   // Redirect the packet to the destination.
   // FIXME: depending on encap_size, it is possible that the encaped needs
