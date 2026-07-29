@@ -48,6 +48,7 @@ func parseDest(deststr string) ([]l4lbdrv.DestinationEntry, error) {
 		dests = append(dests, l4lbdrv.DestinationEntry{
 			IPAddr:       ip4,
 			HardwareAddr: mac,
+			IsAlive:      1,
 		})
 	}
 	log.Printf("dests: %+v", dests)
@@ -85,9 +86,9 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := lb.DumpCounters(); err != nil {
+			/*if err := lb.DumpCounters(); err != nil {
 				slog.Error("Failed to dump counters", slog.String("err", err.Error()))
-			}
+			}*/
 			changed := lb.DoHealthCheck()
 			if changed {
 				slog.Info("sync!")

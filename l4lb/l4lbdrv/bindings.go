@@ -146,6 +146,7 @@ func NowNanoseconds() uint64 {
 type DestinationEntry struct {
 	IPAddr       netip.Addr
 	HardwareAddr net.HardwareAddr
+	IsAlive      uint8
 }
 
 func (e DestinationEntry) String() string {

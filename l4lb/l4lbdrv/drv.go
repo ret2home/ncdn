@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -81,7 +82,7 @@ func New(cfg *Config) (*L4LB, error) {
 	}
 	lb.backendStatus = make([]int, len(cfg.Dests))
 	for i := 0; i < len(cfg.Dests); i++ {
-		lb.backendStatus[i] = 2 // weakly-live
+		lb.backendStatus[i] = 3 // weakly-live
 	}
 
 	if err := lb.Sync(); err != nil {
@@ -112,7 +113,7 @@ func selectPop(status []int, slotId uint32) uint32 {
 	var maxId uint32 = 0
 	var maxHash uint64 = 0
 	for i := 1; i < len(status); i++ {
-		if status[i] >= 2 {
+		if status[i] >= 3 {
 			hs := calcHash(uint32(i), slotId)
 			if maxHash < hs {
 				maxHash = hs
@@ -160,7 +161,6 @@ func (lb *L4LB) Sync() error {
 	}
 
 	fmt.Printf("changed! %v\n", lb.backendStatus)
-	fmt.Printf("update slots! %v\n", destIdForSlots[:8])
 
 	_, err = lb.bindings.SlotsArray.BatchUpdate(slotIds, destIdForSlots, &ebpf.BatchOptions{})
 	if err != nil {
@@ -229,14 +229,29 @@ func NewBackendStatus(status int, result bool) int {
 func (lb *L4LB) DoHealthCheck() bool {
 	lens := len(lb.cfg.Dests)
 	changed := false
+	fmt.Printf("healthcheck...")
+
+	var wg sync.WaitGroup
+	wg.Add(lens - 1)
+
 	for i := 1; i < lens; i++ {
-		url := "http://" + lb.cfg.Dests[i].IPAddr.String() + lb.cfg.HealthCheckDest
-		res := HealthCheckSingle(url)
-		new_status := NewBackendStatus(lb.backendStatus[i], res)
-		if (lb.backendStatus[i] < 2) != (new_status < 2) {
-			changed = true
-		}
-		lb.backendStatus[i] = new_status
+		go func(i int) {
+			defer wg.Done()
+			url := "http://" + lb.cfg.Dests[i].IPAddr.String() + lb.cfg.HealthCheckDest
+			res := HealthCheckSingle(url)
+			new_status := NewBackendStatus(lb.backendStatus[i], res)
+			if (lb.backendStatus[i] == 3) != (new_status == 3) {
+				changed = true
+			}
+			if new_status == 3 {
+				lb.cfg.Dests[i].IsAlive = 1
+			} else {
+				lb.cfg.Dests[i].IsAlive = 0
+			}
+			lb.backendStatus[i] = new_status
+		}(i)
 	}
+	wg.Wait()
+	fmt.Printf("complete!")
 	return changed
 }

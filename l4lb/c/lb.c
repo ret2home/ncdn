@@ -62,11 +62,18 @@ struct {
 struct destination_entry {
   uint32_t ip_address;
   uint8_t mac_address[ETH_ALEN];
+  uint8_t is_alive;
+} PACKED;
+
+struct conn_cache_entry{
+  uint32_t ip_address;
+  uint16_t port;
 } PACKED;
 
 #define DESTINATIONS_SIZE 255 /* go: */
 #define FLOW_HASH_SEED 0x41424344
 #define SLOTS_SIZE 4096
+#define CONN_CACHE_SIZE 65536
 
 // destinations_map is a map that contains the destination_entry for each
 // destination that the load balancer can send packets to.
@@ -85,6 +92,13 @@ struct {
   __type(key, uint32_t);
   __type(value, uint32_t);
 } slots_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, CONN_CACHE_SIZE);
+  __type(key, struct conn_cache_entry);
+  __type(value, uint16_t);
+} conn_cache SEC(".maps");
 
 #if DEBUG_LB_MAIN
 #define debugk(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
@@ -197,20 +211,42 @@ int lb_main(struct xdp_md* ctx) {
 
   struct tcphdr* tcp = (struct tcphdr*)(ip + 1);
 
-  uint32_t key = flow_to_slot(ip->saddr, tcp->source);
   debugk("incoming packet: ip=%pI4 port=%u key=%u", &ip->saddr, ntohs(tcp->source),key);
 
-  uint32_t *dest_idx = bpf_map_lookup_elem(&slots_map, &key);
-  if(!dest_idx){
-    bpf_printk("ASSERTION FAILURE: no slot entry for %d", key);
-    EXIT(XDP_DROP);
+  struct conn_cache_entry cache_key;
+  cache_key.ip_address=ip->saddr;
+  cache_key.port=tcp->source;
+
+  uint32_t *dest_idx = bpf_map_lookup_elem(&conn_cache,&cache_key);
+  struct destination_entry* dest;
+
+  uint8_t valid_cache=0;
+  if(dest_idx){
+    dest = bpf_map_lookup_elem(&destinations_map, dest_idx);
+    if(dest){
+      valid_cache=dest->is_alive;
+    }
   }
-  debugk("dest_idx=%u", *dest_idx);
-  struct destination_entry* dest = bpf_map_lookup_elem(&destinations_map, dest_idx);
-  if (!dest) {
-    bpf_printk("ASSERTION FAILURE: no dest entry for %d", dest_idx);
-    EXIT(XDP_DROP);
+
+  if(!valid_cache){
+    uint32_t key = flow_to_slot(ip->saddr, tcp->source);
+
+    dest_idx = bpf_map_lookup_elem(&slots_map, &key);
+    if(!dest_idx){
+      bpf_printk("ASSERTION FAILURE: no slot entry for %d", key);
+      EXIT(XDP_DROP);
+    }
+    debugk("cache miss! dest_idx=%u", *dest_idx);
+
+    bpf_map_update_elem(&conn_cache, &cache_key, dest_idx, 0);
+
+    dest = bpf_map_lookup_elem(&destinations_map, dest_idx);
+    if (!dest) {
+      bpf_printk("ASSERTION FAILURE: no dest entry for %d", dest_idx);
+      EXIT(XDP_DROP);
+    }
   }
+
   debugk("dest ip=%pI4", &dest->ip_address);
   debugk("dest mac=%02x:%02x:%02x", dest->mac_address[0], dest->mac_address[1], dest->mac_address[2]);
   debugk("         %02x:%02x:%02x", dest->mac_address[3], dest->mac_address[4], dest->mac_address[5]);
