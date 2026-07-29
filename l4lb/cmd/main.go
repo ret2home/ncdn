@@ -21,6 +21,7 @@ var xdpcapHookPath = flag.String("xdpcapHookPath", "/sys/fs/bpf/xdpcap_hook", "P
 var xdpif = flag.String("interface", "net0", "Interface to attach lb prog to")
 var vip = flag.String("vip", "192.0.2.10", "VIP address to load balance")
 var deststr = flag.String("dests", "", "Comma separated list of destination IP and MAC addresses. (Example: 192.168.88.10;00:00:5e:00:53:01,)")
+var statusz = flag.String("statusz", ":8889/statusz", "health check dest")
 
 func parseDest(deststr string) ([]l4lbdrv.DestinationEntry, error) {
 	commas := strings.Split(deststr, ",")
@@ -62,11 +63,13 @@ func main() {
 	}
 
 	cfg := &l4lbdrv.Config{
-		BinPath:        *lbBin,
-		XdpCapHookPath: *xdpcapHookPath,
-		InterfaceName:  *xdpif,
-		VIP:            netip.MustParseAddr(*vip),
-		Dests:          dests,
+		BinPath:         *lbBin,
+		XdpCapHookPath:  *xdpcapHookPath,
+		InterfaceName:   *xdpif,
+		VIP:             netip.MustParseAddr(*vip),
+		Dests:           dests,
+		HealthCheckDest: *statusz,
+		SlotsLength:     4096,
 	}
 	lb, err := l4lbdrv.New(cfg)
 	if err != nil {
@@ -84,6 +87,13 @@ func main() {
 		case <-ticker.C:
 			if err := lb.DumpCounters(); err != nil {
 				slog.Error("Failed to dump counters", slog.String("err", err.Error()))
+			}
+			changed := lb.DoHealthCheck()
+			if changed {
+				slog.Info("sync!")
+				if err := lb.Sync(); err != nil {
+					slog.Error("Failed to sync maps", slog.String("err", err.Error()))
+				}
 			}
 			continue
 

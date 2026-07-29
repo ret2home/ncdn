@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"math/rand/v2"
+	"net/http"
 	"net/netip"
 	"path/filepath"
 	"syscall"
+	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
 	"go.uber.org/multierr"
@@ -20,15 +24,16 @@ type Config struct {
 	InterfaceName  string
 	XdpCapHookPath string
 
-	VIP   netip.Addr
-	Dests DestinationEntries
+	VIP             netip.Addr
+	Dests           DestinationEntries
+	HealthCheckDest string
+	SlotsLength     int
 }
-
 type L4LB struct {
-	cfg *Config
-
-	bindings     *Bindings
-	linkAttacher *LinkAttacher
+	cfg           *Config
+	backendStatus []int // 0,1 -> DOWN, 2,3 -> LIVE
+	bindings      *Bindings
+	linkAttacher  *LinkAttacher
 }
 
 func New(cfg *Config) (*L4LB, error) {
@@ -46,6 +51,7 @@ func New(cfg *Config) (*L4LB, error) {
 			return nil, fmt.Errorf("Failed to get absolute path for %s: %w", cfg.XdpCapHookPath, err)
 		}
 	}
+
 	bindings, err := BindBalancer(aBinPath, aXdpcapHookPath)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to bind balancer: %w", err)
@@ -73,6 +79,11 @@ func New(cfg *Config) (*L4LB, error) {
 		}
 		lb.linkAttacher = a
 	}
+	lb.backendStatus = make([]int, len(cfg.Dests))
+	for i := 0; i < len(cfg.Dests); i++ {
+		lb.backendStatus[i] = 2 // weakly-live
+	}
+
 	if err := lb.Sync(); err != nil {
 		return nil, fmt.Errorf("Initial map sync failed: %w", err)
 	}
@@ -89,6 +100,30 @@ func IPToUint32(ip netip.Addr) (uint32, error) {
 
 	ip4 := ip.As4()
 	return hostOrder.Uint32(ip4[:]), nil
+}
+
+func calcHash(serverID uint32, slotID uint32) uint64 {
+	var key [8]byte
+	binary.LittleEndian.PutUint32(key[0:4], slotID)
+	binary.LittleEndian.PutUint32(key[4:8], serverID)
+	return xxhash.Sum64(key[:])
+}
+func selectPop(status []int, slotId uint32) uint32 {
+	var maxId uint32 = 0
+	var maxHash uint64 = 0
+	for i := 1; i < len(status); i++ {
+		if status[i] >= 2 {
+			hs := calcHash(uint32(i), slotId)
+			if maxHash < hs {
+				maxHash = hs
+				maxId = uint32(i)
+			}
+		}
+	}
+	if maxId == 0 {
+		return uint32(rand.Int32N(int32(len(status)-1)) + 1)
+	}
+	return maxId
 }
 
 func (lb *L4LB) Sync() error {
@@ -113,6 +148,22 @@ func (lb *L4LB) Sync() error {
 	_, err = lb.bindings.DestinationArray.BatchUpdate(keys, lb.cfg.Dests, &ebpf.BatchOptions{})
 	if err != nil {
 		return fmt.Errorf("Failed to update DestinationArray: %w", err)
+	}
+
+	slotIds := make([]uint32, lb.cfg.SlotsLength)
+	for i := range slotIds {
+		slotIds[i] = uint32(i)
+	}
+	destIdForSlots := make([]uint32, lb.cfg.SlotsLength)
+	for i := range destIdForSlots {
+		destIdForSlots[i] = selectPop(lb.backendStatus, uint32(i))
+	}
+
+	fmt.Printf("update slots! %v\n", destIdForSlots[:8])
+
+	_, err = lb.bindings.SlotsArray.BatchUpdate(slotIds, destIdForSlots, &ebpf.BatchOptions{})
+	if err != nil {
+		return fmt.Errorf("Failed to update slots map: %w", err)
 	}
 
 	return nil
@@ -151,4 +202,40 @@ func PrepSystemForXDP() error {
 	slog.Info("Setrlimit(RLIMIT_MEMLOCK)", "Cur", rlim.Cur, "Max", rlim.Max)
 
 	return nil
+}
+
+func HealthCheckSingle(url string) bool {
+	client := &http.Client{
+		Timeout: 300 * time.Millisecond,
+	}
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	success := resp.StatusCode == http.StatusOK
+	if resp != nil {
+		resp.Body.Close()
+	}
+	return success
+}
+
+func NewBackendStatus(status int, result bool) int {
+	if result {
+		return min(3, status+1)
+	}
+	return max(0, status-1)
+}
+func (lb *L4LB) DoHealthCheck() bool {
+	lens := len(lb.cfg.Dests)
+	changed := false
+	for i := 1; i < lens; i++ {
+		url := "http://" + lb.cfg.Dests[i].IPAddr.String() + lb.cfg.HealthCheckDest
+		res := HealthCheckSingle(url)
+		new_status := NewBackendStatus(lb.backendStatus[i], res)
+		if (lb.backendStatus[i] < 2) != (new_status < 2) {
+			changed = true
+		}
+		lb.backendStatus[i] = new_status
+	}
+	return changed
 }

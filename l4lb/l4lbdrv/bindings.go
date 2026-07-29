@@ -42,6 +42,7 @@ type Bindings struct {
 	XdpcapHook       *ebpf.Map     `ebpf:"xdpcap_hook"`
 	DestinationArray *ebpf.Map     `ebpf:"destinations_map"`
 	ConfigMap        *ebpf.Map     `ebpf:"lb_config_map"`
+	SlotsArray       *ebpf.Map     `ebpf:"slots_map"`
 }
 
 func (b *Bindings) Close() error {
@@ -50,6 +51,7 @@ func (b *Bindings) Close() error {
 		b.XdpcapHook.Close(),
 		b.DestinationArray.Close(),
 		b.ConfigMap.Close(),
+		b.SlotsArray.Close(),
 	)
 }
 

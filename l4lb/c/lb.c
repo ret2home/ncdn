@@ -65,6 +65,8 @@ struct destination_entry {
 } PACKED;
 
 #define DESTINATIONS_SIZE 255 /* go: */
+#define FLOW_HASH_SEED 0x41424344
+#define SLOTS_SIZE 4096
 
 // destinations_map is a map that contains the destination_entry for each
 // destination that the load balancer can send packets to.
@@ -77,6 +79,13 @@ struct {
   __type(value, struct destination_entry);
 } destinations_map SEC(".maps");
 
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, (SLOTS_SIZE));
+  __type(key, uint32_t);
+  __type(value, uint32_t);
+} slots_map SEC(".maps");
+
 #if DEBUG_LB_MAIN
 #define debugk(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
 #else
@@ -84,6 +93,48 @@ struct {
   do {                   \
   } while (0)
 #endif
+
+// https://github.com/jwerle/murmurhash.c/blob/master/murmurhash.c
+static __always_inline uint32_t flow_to_slot(uint32_t src_ip, uint16_t src_port) {
+  const uint32_t c1 = 0xcc9e2d51;
+  const uint32_t c2 = 0x1b873593;
+
+  uint32_t r1 = 15;
+  uint32_t r2 = 13;
+  uint32_t m = 5;
+  uint32_t n = 0xe6546b64;
+
+  uint32_t h = FLOW_HASH_SEED;
+  uint32_t k;
+
+  k = src_ip;
+  k *= c1;
+  k = (k << r1) | (k >> (32 - r1));
+  k *= c2;
+
+  h ^= k;
+  h = (h << r2) | (h >> (32 - r2));
+  h = h * m + n;
+
+  k = (uint32_t)(src_port);
+  k *= c1;
+  k = (k << r1) | (k >> (32 - r1));
+  k *= c2;
+
+  h ^= k;
+  h = (h << r2) | (h >> (32 - r2));
+  h = h * m + n;
+
+  h ^= 8;
+
+  h ^= h >> 16;
+  h *= 0x85ebca6b;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35;
+  h ^= h >> 16;
+
+  return h & (SLOTS_SIZE - 1);
+}
 
 SEC("xdp")
 int lb_main(struct xdp_md* ctx) {
@@ -93,8 +144,7 @@ int lb_main(struct xdp_md* ctx) {
   // Get pointer to the `stat_counters`. The stats are stored per CPU,
   // and the driver code will sum them up upon read.
   const uint32_t map_key_zero = 0;
-  struct stat_counters* c =
-      bpf_map_lookup_elem(&stat_counters_map, &map_key_zero);
+  struct stat_counters* c = bpf_map_lookup_elem(&stat_counters_map, &map_key_zero);
   if (!c) {
     EXIT(XDP_PASS);
   }
@@ -107,16 +157,13 @@ int lb_main(struct xdp_md* ctx) {
   }
 
   // Lookup ip address and mac address to be used for the source header fields.
-  struct destination_entry* src_entry =
-      bpf_map_lookup_elem(&destinations_map, &map_key_zero);
+  struct destination_entry* src_entry = bpf_map_lookup_elem(&destinations_map, &map_key_zero);
   if (!src_entry) {
     EXIT(XDP_PASS);
   }
 
   // Check if the packet is long enough to contain the headers we need.
-  if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) +
-          sizeof(struct tcphdr) >
-      data_end) {
+  if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) > data_end) {
     ++c->too_short_packet_total;
     EXIT(XDP_PASS);
   }
@@ -150,12 +197,16 @@ int lb_main(struct xdp_md* ctx) {
 
   struct tcphdr* tcp = (struct tcphdr*)(ip + 1);
 
-  uint32_t key = ip->saddr + tcp->source;
+  uint32_t key = flow_to_slot(ip->saddr, tcp->source);
   debugk("incoming packet: ip=%pI4 port=%u", &ip->saddr, ntohs(tcp->source));
 
-  uint32_t dest_idx = (key % config->num_dests) + 1;
+  uint32_t *dest_idx = bpf_map_lookup_elem(&slots_map, &key);
+  if(!dest_idx){
+    bpf_printk("ASSERTION FAILURE: no slot entry for %d", key);
+    EXIT(XDP_DROP);
+  }
   debugk("dest_idx=%d", dest_idx);
-  struct destination_entry* dest = bpf_map_lookup_elem(&destinations_map, &dest_idx);
+  struct destination_entry* dest = bpf_map_lookup_elem(&destinations_map, dest_idx);
   if (!dest) {
     bpf_printk("ASSERTION FAILURE: no dest entry for %d", dest_idx);
     EXIT(XDP_DROP);
@@ -172,9 +223,7 @@ int lb_main(struct xdp_md* ctx) {
 
   // make verifier happy - this is guaranteed by the `bpf_xdp_adjust_head`
   // success, but the verifier is not currently smart enough to know that.
-  if (ctx->data + sizeof(struct ethhdr) + sizeof(struct iphdr) +
-          sizeof(struct iphdr) >
-      ctx->data_end) {
+  if (ctx->data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct iphdr) > ctx->data_end) {
     bpf_printk("NOT REACHED!!!");
     EXIT(XDP_DROP);
   }
@@ -191,7 +240,7 @@ int lb_main(struct xdp_md* ctx) {
   struct iphdr* ip2 = (void*)(eth + 1);
 
   ip = (void*)(ip2 + 1);
-  uint16_t iphdr_tot_len = ntohs(ip->tot_len); // FIXME - should be always fixed.
+  uint16_t iphdr_tot_len = ntohs(ip->tot_len);  // FIXME - should be always fixed.
 
   ip2->version = 4;
   ip2->ihl = 0x5;
