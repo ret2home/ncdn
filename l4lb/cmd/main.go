@@ -86,9 +86,9 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
-			/*if err := lb.DumpCounters(); err != nil {
+			if err := lb.DumpCounters(); err != nil {
 				slog.Error("Failed to dump counters", slog.String("err", err.Error()))
-			}*/
+			}
 			changed := lb.DoHealthCheck()
 			if changed {
 				slog.Info("sync!")

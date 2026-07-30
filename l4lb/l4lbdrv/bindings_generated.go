@@ -25,6 +25,9 @@ type StatCounters struct { // ../c/lb.c:28
 	NoVipMatchTotal              uint64 // ../c/lb.c:36
 	FailedAdjustHeadTotal        uint64 // ../c/lb.c:37
 	FailedAdjustTailTotal        uint64 // ../c/lb.c:38
+	FoundAliveCacheTotal         uint64
+	FoundDeadCacheTotal          uint64
+	NotFoundCacheTotal           uint64
 }
 
 func StatCountersAssertLayout(s *DWARFStruct) error {
@@ -86,6 +89,21 @@ func StatCountersAssertLayout(s *DWARFStruct) error {
 	if goff != uintptr(doff) {
 		return fmt.Errorf("offset mismatch: go FailedAdjustTailTotal: %d, dwarf failed_adjust_tail_total: %d", goff, doff)
 	}
+	goff = unsafe.Offsetof(StatCounters{}.FoundAliveCacheTotal)
+	doff = fs["found_alive_cache_total"].Offset
+	if goff != uintptr(doff) {
+		return fmt.Errorf("offset mismatch: go FoundAliveCacheTotal: %d, dwarf found_alive_cache_total: %d", goff, doff)
+	}
+	goff = unsafe.Offsetof(StatCounters{}.FoundDeadCacheTotal)
+	doff = fs["found_dead_cache_total"].Offset
+	if goff != uintptr(doff) {
+		return fmt.Errorf("offset mismatch: go FoundDeadCacheTotal: %d, dwarf found_dead_cache_total: %d", goff, doff)
+	}
+	goff = unsafe.Offsetof(StatCounters{}.NotFoundCacheTotal)
+	doff = fs["notfound_cache_total"].Offset
+	if goff != uintptr(doff) {
+		return fmt.Errorf("offset mismatch: go NotFoundCacheTotal: %d, dwarf notfound_cache_total: %d", goff, doff)
+	}
 
 	return nil
 }
@@ -100,6 +118,9 @@ func (c *StatCounters) Add(other *StatCounters) {
 	c.NoVipMatchTotal += other.NoVipMatchTotal
 	c.FailedAdjustHeadTotal += other.FailedAdjustHeadTotal
 	c.FailedAdjustTailTotal += other.FailedAdjustTailTotal
+	c.FoundAliveCacheTotal += other.FoundAliveCacheTotal
+	c.FoundDeadCacheTotal += other.FoundDeadCacheTotal
+	c.NotFoundCacheTotal += other.NotFoundCacheTotal
 }
 
 func (c *StatCounters) String() string {
@@ -131,6 +152,15 @@ func (c *StatCounters) String() string {
 	}
 	if c.FailedAdjustTailTotal != 0 {
 		buf.WriteString(fmt.Sprintf("FailedAdjustTailTotal=%d, ", c.FailedAdjustTailTotal))
+	}
+	if c.FoundAliveCacheTotal != 0 {
+		buf.WriteString(fmt.Sprintf("FoundAliveCacheTotal=%d, ", c.FoundAliveCacheTotal))
+	}
+	if c.FoundDeadCacheTotal != 0 {
+		buf.WriteString(fmt.Sprintf("FoundDeadCacheTotal=%d, ", c.FoundDeadCacheTotal))
+	}
+	if c.NotFoundCacheTotal != 0 {
+		buf.WriteString(fmt.Sprintf("NotFoundCacheTotal=%d, ", c.NotFoundCacheTotal))
 	}
 	if strings.HasSuffix(buf.String(), ", ") {
 		buf.Truncate(buf.Len() - 2)

@@ -33,6 +33,9 @@ struct stat_counters { /* go:Add,String */
   uint64_t no_vip_match_total; // HELP Number of packets dropped due to their dest IP address not matching any known VIP.
   uint64_t failed_adjust_head_total; // HELP Number of xdp_adjust_head failures.
   uint64_t failed_adjust_tail_total; // HELP Number of xdp_adjust_tail failures.
+  uint64_t found_alive_cache_total;
+  uint64_t found_dead_cache_total;
+  uint64_t notfound_cache_total;
 } ALIGN8;
 // clang-format on
 
@@ -226,10 +229,17 @@ int lb_main(struct xdp_md* ctx) {
     if(dest){
       valid_cache=dest->is_alive;
       debugk("cache found! dest_idx=%u alive=%u", *dest_idx, valid_cache);
+
+      if(valid_cache){
+        ++c->found_alive_cache_total;
+      }else{
+        ++c->found_dead_cache_total;
+      }
     }else{
       debugk("what happened??????????????????????");
     }
   }else{
+      ++c->notfound_cache_total;
       debugk("cache not found!");
   }
 
