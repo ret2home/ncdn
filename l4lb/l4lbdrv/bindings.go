@@ -42,6 +42,7 @@ type Bindings struct {
 	XdpcapHook       *ebpf.Map     `ebpf:"xdpcap_hook"`
 	DestinationArray *ebpf.Map     `ebpf:"destinations_map"`
 	ConfigMap        *ebpf.Map     `ebpf:"lb_config_map"`
+	SlotsArray       *ebpf.Map     `ebpf:"slots_map"`
 }
 
 func (b *Bindings) Close() error {
@@ -50,6 +51,7 @@ func (b *Bindings) Close() error {
 		b.XdpcapHook.Close(),
 		b.DestinationArray.Close(),
 		b.ConfigMap.Close(),
+		b.SlotsArray.Close(),
 	)
 }
 
@@ -144,6 +146,7 @@ func NowNanoseconds() uint64 {
 type DestinationEntry struct {
 	IPAddr       netip.Addr
 	HardwareAddr net.HardwareAddr
+	IsAlive      uint8
 }
 
 func (e DestinationEntry) String() string {
@@ -152,7 +155,7 @@ func (e DestinationEntry) String() string {
 
 type DestinationEntries []DestinationEntry
 
-const DestinationEntrySize = 10
+const DestinationEntrySize = 11
 
 func (es DestinationEntries) MarshalBinary() ([]byte, error) {
 	buf := make([]byte, len(es)*DestinationEntrySize)
@@ -168,6 +171,9 @@ func (es DestinationEntries) MarshalBinary() ([]byte, error) {
 		}
 		copy(bs[0:6], e.HardwareAddr)
 		bs = bs[6:]
+
+		copy(bs[0:1], []uint8{e.IsAlive})
+		bs = bs[1:]
 	}
 
 	return buf, nil

@@ -61,6 +61,8 @@ add_ns R "192.168.88.1/24"
 add_ns LB "192.168.88.20/24"
 add_ns C0 "192.168.88.10/24"
 add_ns C1 "192.168.88.11/24"
+add_ns C2 "192.168.88.12/24"
+add_ns C3 "192.168.88.13/24"
 add_ns O "192.168.88.30/24"
 
 # veth: U (198.51.100.200/24) <-> R (198.51.100.1/24)
@@ -77,12 +79,16 @@ ip netns exec R sysctl -w net.ipv4.ip_forward=1
 ip netns exec LB sysctl -w net.ipv4.ip_forward=1
 ip netns exec C0 sysctl -w net.ipv4.ip_forward=1
 ip netns exec C1 sysctl -w net.ipv4.ip_forward=1
+ip netns exec C2 sysctl -w net.ipv4.ip_forward=1
+ip netns exec C3 sysctl -w net.ipv4.ip_forward=1
 
 # default route to R
 ip -n U r add default via 198.51.100.1
 ip -n LB r add default via 192.168.88.1
 ip -n C0 r add default via 192.168.88.1
 ip -n C1 r add default via 192.168.88.1
+ip -n C2 r add default via 192.168.88.1
+ip -n C3 r add default via 192.168.88.1
 # ip netns exec O ip r add default via 192.168.88.1
 
 # LB->C0 ipip tunnel - claim VIP
@@ -94,6 +100,16 @@ ip -n C0 a add 192.0.2.10/32 dev ipip0
 ip -n C1 tunnel a ipip0 remote 192.168.88.20 local 192.168.88.11 dev net0
 ip -n C1 l set ipip0 up
 ip -n C1 a add 192.0.2.10/32 dev ipip0
+
+# LB->C2 ipip tunnel - claim VIP
+ip -n C2 tunnel a ipip0 remote 192.168.88.20 local 192.168.88.12 dev net0
+ip -n C2 l set ipip0 up
+ip -n C2 a add 192.0.2.10/32 dev ipip0
+
+# LB->C3 ipip tunnel - claim VIP
+ip -n C3 tunnel a ipip0 remote 192.168.88.20 local 192.168.88.13 dev net0
+ip -n C3 l set ipip0 up
+ip -n C3 a add 192.0.2.10/32 dev ipip0
 
 # Route VIPs to LB
 ip -n R r add 192.0.2.0/24 via 192.168.88.20

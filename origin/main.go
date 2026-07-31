@@ -2,12 +2,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
-	"encoding/json"
 
 	"github.com/yzp0n/ncdn/httprps"
 )
@@ -16,12 +16,12 @@ var nodeId = flag.String("nodeId", "unknown_node", "Name of the node")
 var listenAddr = flag.String("listenAddr", ":8888", "Address to listen on")
 
 type requestInfo struct {
-		RemoteAddr string
-		PopCacheId string
-		OriginId   string
-	}
+	RemoteAddr string
+	PopCacheId string
+	OriginId   string
+}
 
-func dumpRequestInfo(r *http.Request) (requestInfo) {
+func dumpRequestInfo(r *http.Request) requestInfo {
 	return requestInfo{
 		RemoteAddr: r.RemoteAddr,
 		PopCacheId: r.Header.Get("X-NCDN-PoPCache-NodeId"),
@@ -63,7 +63,7 @@ func serveJsonInternal(w http.ResponseWriter, r *http.Request) error {
 	ri := dumpRequestInfo(r)
 
 	bs, err := json.MarshalIndent(ri, "", "  ")
-	if err!=nil {
+	if err != nil {
 		return err
 	}
 
@@ -83,7 +83,6 @@ func serveJson(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
-
 
 func main() {
 	flag.Parse()
