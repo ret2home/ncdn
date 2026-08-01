@@ -5,7 +5,6 @@ import (
 	"flag"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"time"
 
@@ -53,14 +52,17 @@ func main() {
 		// return 204
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.Handle("/", &httputil.ReverseProxy{
+
+	cs := NewCacheServer(originURL, *nodeId)
+	mux.Handle("/", cs)
+	/*mux.Handle("/", &httputil.ReverseProxy{
 		// FIXME: actually cache stuff...
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetXForwarded()
 			r.Out.Header.Set("X-NCDN-PoPCache-NodeId", *nodeId)
 			r.SetURL(originURL)
 		},
-	})
+	})*/
 
 	log.Printf("Listening on %s...", *listenAddr)
 	if err := http.ListenAndServe(*listenAddr, nil); err != nil {
