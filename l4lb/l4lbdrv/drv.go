@@ -25,8 +25,10 @@ type Config struct {
 	InterfaceName  string
 	XdpCapHookPath string
 
-	VIP             netip.Addr
-	Dests           DestinationEntries
+	VIP4            netip.Addr
+	VIP6            netip.Addr
+	DestsIpIp6      DestinationEntries
+	DestsIp6Ip6     DestinationEntries
 	HealthCheckDest string
 	SlotsLength     int
 }
@@ -80,8 +82,8 @@ func New(cfg *Config) (*L4LB, error) {
 		}
 		lb.linkAttacher = a
 	}
-	lb.backendStatus = make([]int, len(cfg.Dests))
-	for i := 0; i < len(cfg.Dests); i++ {
+	lb.backendStatus = make([]int, len(cfg.DestsIpIp6))
+	for i := 0; i < len(cfg.DestsIpIp6); i++ {
 		lb.backendStatus[i] = 3 // weakly-live
 	}
 
@@ -128,27 +130,33 @@ func selectPop(status []int, slotId uint32) uint32 {
 }
 
 func (lb *L4LB) Sync() error {
-	vip4, err := IPToUint32(lb.cfg.VIP)
+	vip4, err := IPToUint32(lb.cfg.VIP4)
 	if err != nil {
 		return fmt.Errorf("vip: %w", err)
 	}
 
 	err = lb.bindings.ConfigMap.Update(uint32(0), &LbConfig{
-		VipAddress: vip4,
-		NumDests:   uint32(len(lb.cfg.Dests) - 1),
+		VipAddressV4:     vip4,
+		VipAddressV6Byte: lb.cfg.VIP6.As16(),
+		NumDests:         uint32(len(lb.cfg.DestsIpIp6) - 1),
 	}, 0)
 	if err != nil {
 		return fmt.Errorf("Failed to update ConfigMap: %w", err)
 	}
 
-	keys := make([]uint32, len(lb.cfg.Dests))
+	keys := make([]uint32, len(lb.cfg.DestsIpIp6))
 	for i := range keys {
 		keys[i] = uint32(i)
 	}
 
-	_, err = lb.bindings.DestinationArray.BatchUpdate(keys, lb.cfg.Dests, &ebpf.BatchOptions{})
+	_, err = lb.bindings.DestinationArrayIpIp6.BatchUpdate(keys, lb.cfg.DestsIpIp6, &ebpf.BatchOptions{})
 	if err != nil {
-		return fmt.Errorf("Failed to update DestinationArray: %w", err)
+		return fmt.Errorf("Failed to update DestinationArrayIpIp6: %w", err)
+	}
+
+	_, err = lb.bindings.DestinationArrayIp6Ip6.BatchUpdate(keys, lb.cfg.DestsIp6Ip6, &ebpf.BatchOptions{})
+	if err != nil {
+		return fmt.Errorf("Failed to update DestinationArrayIp6Ip6: %w", err)
 	}
 
 	slotIds := make([]uint32, lb.cfg.SlotsLength)
@@ -227,7 +235,7 @@ func NewBackendStatus(status int, result bool) int {
 	return max(0, status-1)
 }
 func (lb *L4LB) DoHealthCheck() bool {
-	lens := len(lb.cfg.Dests)
+	lens := len(lb.cfg.DestsIpIp6)
 	changed := false
 
 	var wg sync.WaitGroup
@@ -236,16 +244,16 @@ func (lb *L4LB) DoHealthCheck() bool {
 	for i := 1; i < lens; i++ {
 		go func(i int) {
 			defer wg.Done()
-			url := "http://" + lb.cfg.Dests[i].IPAddr.String() + lb.cfg.HealthCheckDest
+			url := "http://[" + lb.cfg.DestsIpIp6[i].IPAddr.String() + "]" + lb.cfg.HealthCheckDest
 			res := HealthCheckSingle(url)
 			new_status := NewBackendStatus(lb.backendStatus[i], res)
 			if (lb.backendStatus[i] == 3) != (new_status == 3) {
 				changed = true
 			}
 			if new_status == 3 {
-				lb.cfg.Dests[i].IsAlive = 1
+				lb.cfg.DestsIpIp6[i].IsAlive = 1
 			} else {
-				lb.cfg.Dests[i].IsAlive = 0
+				lb.cfg.DestsIpIp6[i].IsAlive = 0
 			}
 			lb.backendStatus[i] = new_status
 		}(i)

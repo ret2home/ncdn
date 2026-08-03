@@ -37,13 +37,25 @@ func DumpDebugPcap(b []byte) {
 
 func TestL4LB(t *testing.T) {
 	vip4 := netip.MustParseAddr("192.0.2.10")
+	vip6 := netip.MustParseAddr("fd6e:3de7:745b:0001:192:0:2:10")
 	lbIp4 := netip.MustParseAddr("192.168.0.254")
 	lbMAC := []byte{0x00, 0x00, 0x5e, 0x00, 0x53, 0xfe}
 
 	cfg := &Config{
 		BinPath: "../c/lb.o",
-		VIP:     vip4,
-		Dests: []DestinationEntry{
+		VIP4:    vip4,
+		VIP6:    vip6,
+		DestsIpIp6: []DestinationEntry{
+			{
+				IPAddr:       lbIp4,
+				HardwareAddr: lbMAC,
+			},
+			{
+				IPAddr:       netip.MustParseAddr("192.168.0.10"),
+				HardwareAddr: []byte{0x00, 0x00, 0x5e, 0x00, 0x53, 0x10},
+			},
+		},
+		DestsIp6Ip6: []DestinationEntry{
 			{
 				IPAddr:       lbIp4,
 				HardwareAddr: lbMAC,
