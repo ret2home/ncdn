@@ -22,7 +22,7 @@ var xdpif = flag.String("interface", "net0", "Interface to attach lb prog to")
 var vip4 = flag.String("vip4", "192.0.2.10", "VIP address to load balance")
 var vip6 = flag.String("vip6", "fd6e:3de7:745b:0001:192:0:2:10", "VIP address to load balance")
 var dest_ipip6str = flag.String("dests_ipip6", "", "Comma separated list of destination IP and MAC addresses. (Example: 192.168.88.10;00:00:5e:00:53:01,)")
-var dest_ip6ip6str = flag.String("dests_ip6ip6", "", "Comma separated list of destination IP and MAC addresses. (Example: 192.168.88.10;00:00:5e:00:53:01,)")
+var dest_ip6ip6str = flag.String("dests_ip6ip6", "", "Comma separated list of destination IP and MAC addresses. (Example: fd6e:3de7:745b:ffff:192:168:88:100;00:00:5e:00:53:01,)")
 var statusz = flag.String("statusz", ":8889/statusz", "health check dest")
 
 func parseDest(deststr string) ([]l4lbdrv.DestinationEntry, error) {
