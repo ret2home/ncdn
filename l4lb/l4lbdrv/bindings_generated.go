@@ -170,8 +170,9 @@ func (c *StatCounters) String() string {
 }
 
 type LbConfig struct { // ../c/lb.c:49
-	VipAddress uint32 // ../c/lb.c:50
-	NumDests   uint32 // ../c/lb.c:51
+	VipAddressV4     uint32   // ../c/lb.c:50
+	VipAddressV6Byte [16]byte // ../c/lb.c:50
+	NumDests         uint32   // ../c/lb.c:51
 }
 
 func LbConfigAssertLayout(s *DWARFStruct) error {
@@ -188,11 +189,17 @@ func LbConfigAssertLayout(s *DWARFStruct) error {
 
 	var goff uintptr
 	var doff int64
-	goff = unsafe.Offsetof(LbConfig{}.VipAddress)
-	doff = fs["vip_address"].Offset
+	goff = unsafe.Offsetof(LbConfig{}.VipAddressV4)
+	doff = fs["vip_address_v4"].Offset
 	if goff != uintptr(doff) {
 		return fmt.Errorf("offset mismatch: go VipAddress: %d, dwarf vip_address: %d", goff, doff)
 	}
+	goff = unsafe.Offsetof(LbConfig{}.VipAddressV6Byte)
+	doff = fs["vip_address_v6_byte"].Offset
+	if goff != uintptr(doff) {
+		return fmt.Errorf("offset mismatch: go VipAddressV6Byte: %d, dwarf vip_address_v6_byte: %d", goff, doff)
+	}
+
 	goff = unsafe.Offsetof(LbConfig{}.NumDests)
 	doff = fs["num_dests"].Offset
 	if goff != uintptr(doff) {
