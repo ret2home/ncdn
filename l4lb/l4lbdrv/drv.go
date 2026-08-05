@@ -244,9 +244,8 @@ func (lb *L4LB) DoHealthCheck() bool {
 	for i := 1; i < lens; i++ {
 		go func(i int) {
 			defer wg.Done()
-			//url := "http://[" + lb.cfg.DestsIpIp6[i].IPAddr.String() + "]" + lb.cfg.HealthCheckDest
-			//res := HealthCheckSingle(url)
-			res := true
+			url := "http://[" + lb.cfg.DestsIpIp6[i].IPAddr.String() + "]" + lb.cfg.HealthCheckDest
+			res := HealthCheckSingle(url)
 			new_status := NewBackendStatus(lb.backendStatus[i], res)
 			if (lb.backendStatus[i] == 3) != (new_status == 3) {
 				changed = true
