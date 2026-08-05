@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -78,6 +77,12 @@ func (c *CacheServer) internalNewRequest(w http.ResponseWriter, r *http.Request)
 	}
 
 	req.Header.Set("X-NCDN-PoPCache-NodeId", c.nodeId)
+
+	prevPopID := r.Header.Get("X-NCDN-PoPCache-NodeId")
+	if prevPopID != "" {
+		req.Header.Set("X-NCDN-PoPCache-NodeId", prevPopID)
+	}
+
 	resp, err := c.client.Do(req)
 	if err != nil {
 		c.mu.Lock()
@@ -96,7 +101,7 @@ func (c *CacheServer) internalNewRequest(w http.ResponseWriter, r *http.Request)
 			w.Header().Add(key, value)
 		}
 	}
-	w.Header().Add("X-Cache", "MISS")
+	w.Header().Set("X-Cache", "MISS")
 	w.WriteHeader(resp.StatusCode)
 	if _, err = io.Copy(w, reader); err != nil {
 		c.mu.Lock()
@@ -187,8 +192,6 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		c.mu.Lock()
 		waiter_entry.waiters--
-
-		fmt.Printf("waiters: %d\n", waiter_entry.waiters)
 
 		res := c.loading[uri].result
 		// OK_RETURNING -> HIT_CLEAN
