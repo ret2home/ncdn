@@ -90,6 +90,12 @@ func main() {
 	fs := http.FileServer(http.Dir("./static"))
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/number/{num}", func(w http.ResponseWriter, r *http.Request) {
+		num := r.PathValue("num")
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Hello %s\n", num)
+	})
 	mux.HandleFunc("/index.html", serveIndexHTML)
 	mux.HandleFunc("/json", serveJson)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

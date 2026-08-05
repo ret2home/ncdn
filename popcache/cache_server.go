@@ -9,12 +9,6 @@ import (
 	"time"
 )
 
-type CacheEntry struct {
-	statusCode int
-	header     http.Header
-	data       []byte
-	expire     time.Time
-}
 type WaiterEntry struct {
 	ch       chan struct{}
 	waiters  int
@@ -22,19 +16,19 @@ type WaiterEntry struct {
 	result   *CacheEntry
 }
 type CacheServer struct {
-	origin   *url.URL
-	cachemap map[string]*CacheEntry
-	loading  map[string]*WaiterEntry
-	client   *http.Client
-	nodeId   string
-	mu       sync.RWMutex
+	origin     *url.URL
+	sievecache SieveCache
+	loading    map[string]*WaiterEntry
+	client     *http.Client
+	nodeId     string
+	mu         sync.RWMutex
 }
 
 func NewCacheServer(origin *url.URL, nodeId string) *CacheServer {
 	cs := CacheServer{
-		origin:   origin,
-		cachemap: make(map[string]*CacheEntry),
-		loading:  map[string]*WaiterEntry{},
+		origin:     origin,
+		sievecache: *NewSieveCache(),
+		loading:    map[string]*WaiterEntry{},
 		client: &http.Client{
 			Timeout: 5 * time.Second,
 		},
@@ -51,6 +45,7 @@ func (c *CacheServer) finishLoading(uri string) {
 	// OK_RETURNING -> HIT_CLEAN
 	// NG_RETURNING -> NOT_LOADED
 	if c.loading[uri].waiters == 0 {
+		c.sievecache.SetPin(uri, false)
 		delete(c.loading, uri)
 	}
 }
@@ -119,7 +114,8 @@ func (c *CacheServer) internalNewRequest(w http.ResponseWriter, r *http.Request)
 		expire:     time.Now().Add(time.Second * 5),
 	}
 	if resp.StatusCode == http.StatusOK {
-		c.cachemap[uri] = c.loading[uri].result
+		c.sievecache.Set(uri, c.loading[uri].result)
+		c.sievecache.SetPin(uri, true)
 	}
 	c.finishLoading(uri)
 	c.mu.Unlock()
@@ -149,7 +145,7 @@ func internalServeCache(v *CacheEntry, w http.ResponseWriter, XCache string) {
 func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	uri := r.URL.RequestURI()
 	c.mu.Lock()
-	cachev, cachehit := c.cachemap[uri]
+	cachev, cachehit := c.sievecache.Get(uri)
 	waiter_entry, loading_flag := c.loading[uri]
 
 	not_loaded := !cachehit && !loading_flag
@@ -160,7 +156,7 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// HIT_CLEAN -> NOT_LOADED
 	if hit_clean && time.Now().After(cachev.expire) {
-		delete(c.cachemap, uri)
+		c.sievecache.Delete(uri)
 		hit_clean = false
 		not_loaded = true
 	}
@@ -197,6 +193,7 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// OK_RETURNING -> HIT_CLEAN
 		// NG_RETURNING -> NOT_LOADED
 		if waiter_entry.waiters == 0 {
+			c.sievecache.SetPin(uri, false)
 			delete(c.loading, uri)
 		}
 		c.mu.Unlock()
