@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -10,7 +11,8 @@ const MAXSIZE = 1024
 type CacheEntry struct {
 	statusCode int
 	header     http.Header
-	data       []byte
+	path       string
+	size       uint64
 	expire     time.Time
 }
 type cacheattr struct {
@@ -42,8 +44,8 @@ func (c *SieveCache) Get(key string) (*CacheEntry, bool) {
 	}
 }
 
-func (c *SieveCache) insertInternal(key string, val *CacheEntry) {
-	c.cache[key] = val
+func (c *SieveCache) insertInternal(key string, ent *CacheEntry) {
+	c.cache[key] = ent
 	c.attr[key] = &cacheattr{
 		accessed: false,
 		deleted:  false,
@@ -52,6 +54,7 @@ func (c *SieveCache) insertInternal(key string, val *CacheEntry) {
 	c.size++
 }
 func (c *SieveCache) evict(e *ListEntry) {
+	os.Remove(c.cache[e.val].path)
 	delete(c.cache, e.val)
 	delete(c.attr, e.val)
 	c.size--
@@ -68,18 +71,18 @@ func (c *SieveCache) evictOne() {
 		c.list.MoveHand()
 	}
 }
-func (c *SieveCache) evictAndInsertInternal(key string, val *CacheEntry) {
+func (c *SieveCache) evictAndInsertInternal(key string, ent *CacheEntry) {
 	if c.size < MAXSIZE {
-		c.insertInternal(key, val)
+		c.insertInternal(key, ent)
 	} else {
 		c.evictOne()
-		c.insertInternal(key, val)
+		c.insertInternal(key, ent)
 	}
 }
-func (c *SieveCache) Set(key string, val *CacheEntry) {
+func (c *SieveCache) Set(key string, ent *CacheEntry) {
 	_, ok := c.cache[key]
 	if ok {
-		c.cache[key] = val
+		c.cache[key] = ent
 		if c.attr[key].deleted {
 			c.attr[key] = &cacheattr{
 				accessed: false,
@@ -87,7 +90,7 @@ func (c *SieveCache) Set(key string, val *CacheEntry) {
 			}
 		}
 	} else {
-		c.evictAndInsertInternal(key, val)
+		c.evictAndInsertInternal(key, ent)
 	}
 }
 
