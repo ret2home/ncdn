@@ -10,10 +10,8 @@ import (
 )
 
 type WaiterEntry struct {
-	ch       chan struct{}
-	waiters  int
-	finished bool
-	result   *CacheEntry
+	ch     chan struct{}
+	result *CacheEntry
 }
 type CacheServer struct {
 	origin     *url.URL
@@ -38,16 +36,8 @@ func NewCacheServer(origin *url.URL, nodeId string) *CacheServer {
 }
 
 func (c *CacheServer) finishLoading(uri string) {
-	// WAITING -> OK/NG RETURNING
 	close(c.loading[uri].ch)
-	c.loading[uri].finished = true
-
-	// OK_RETURNING -> HIT_CLEAN
-	// NG_RETURNING -> NOT_LOADED
-	if c.loading[uri].waiters == 0 {
-		c.sievecache.SetPin(uri, false)
-		delete(c.loading, uri)
-	}
+	delete(c.loading, uri)
 }
 
 func (c *CacheServer) internalNewRequest(w http.ResponseWriter, r *http.Request) {
@@ -115,7 +105,6 @@ func (c *CacheServer) internalNewRequest(w http.ResponseWriter, r *http.Request)
 	}
 	if resp.StatusCode == http.StatusOK {
 		c.sievecache.Set(uri, c.loading[uri].result)
-		c.sievecache.SetPin(uri, true)
 	}
 	c.finishLoading(uri)
 	c.mu.Unlock()
@@ -133,9 +122,7 @@ func internalServeCache(v *CacheEntry, w http.ResponseWriter, XCache string) {
 }
 
 // NOT_LOADED : !cache && !loading
-// WAITING    : !cache && !loading.finished && loading.chan is open
-// OK_RETURNING  : cache && loading.finished && loading.chan is closed && loading.waiters > 0
-// NG_RETURNING  :!cache && loading.finished && loading.chan is closed && loading.waiters > 0
+// WAITING    : !cache && loading
 // HIT_CLEAN  :  cache && !loading
 
 // NOT_LOADED -> WAITING -> OK_RETURNING -> HIT_CLEAN -> NOT_LOADED
@@ -149,10 +136,8 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	waiter_entry, loading_flag := c.loading[uri]
 
 	not_loaded := !cachehit && !loading_flag
-	waiting := !cachehit && loading_flag && !waiter_entry.finished
-	ok_returning := cachehit && loading_flag && waiter_entry.finished
-	ng_returning := !cachehit && loading_flag && waiter_entry.finished
-	hit_clean := cachehit && !loading_flag
+	waiting := !cachehit && loading_flag
+	hit_clean := cachehit
 
 	// HIT_CLEAN -> NOT_LOADED
 	if hit_clean && time.Now().After(cachev.expire) {
@@ -164,19 +149,10 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if not_loaded {
 		// NOT_LOADED -> WAITING
 		c.loading[uri] = &WaiterEntry{
-			waiters:  0,
-			finished: false,
-			ch:       make(chan struct{}),
-			result:   nil,
+			ch:     make(chan struct{}),
+			result: nil,
 		}
-	} else if waiting {
-		waiter_entry.waiters++
-	} else if ok_returning || ng_returning {
-		res := c.loading[uri].result
-		c.mu.Unlock()
-		internalServeCache(res, w, "COLLAPSED")
-		return
-	} else {
+	} else if hit_clean {
 		c.mu.Unlock()
 		internalServeCache(cachev, w, "HIT")
 		return
@@ -186,19 +162,7 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if waiting {
 		<-waiter_entry.ch
 
-		c.mu.Lock()
-		waiter_entry.waiters--
-
-		res := c.loading[uri].result
-		// OK_RETURNING -> HIT_CLEAN
-		// NG_RETURNING -> NOT_LOADED
-		if waiter_entry.waiters == 0 {
-			c.sievecache.SetPin(uri, false)
-			delete(c.loading, uri)
-		}
-		c.mu.Unlock()
-
-		internalServeCache(res, w, "COLLAPSED")
+		internalServeCache(waiter_entry.result, w, "COLLAPSED")
 		return
 	}
 	c.internalNewRequest(w, r)

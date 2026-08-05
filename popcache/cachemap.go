@@ -14,7 +14,6 @@ type CacheEntry struct {
 	expire     time.Time
 }
 type cacheattr struct {
-	pin      bool
 	deleted  bool
 	accessed bool
 }
@@ -46,7 +45,6 @@ func (c *SieveCache) Get(key string) (*CacheEntry, bool) {
 func (c *SieveCache) insertInternal(key string, val *CacheEntry) {
 	c.cache[key] = val
 	c.attr[key] = &cacheattr{
-		pin:      false,
 		accessed: false,
 		deleted:  false,
 	}
@@ -62,7 +60,7 @@ func (c *SieveCache) evict(e *ListEntry) {
 func (c *SieveCache) evictOne() {
 	for {
 		key := c.list.hand.val
-		if (c.attr[key].deleted || !c.attr[key].accessed) && !c.attr[key].pin {
+		if c.attr[key].deleted || !c.attr[key].accessed {
 			c.evict(c.list.hand)
 			return
 		}
@@ -84,7 +82,6 @@ func (c *SieveCache) Set(key string, val *CacheEntry) {
 		c.cache[key] = val
 		if c.attr[key].deleted {
 			c.attr[key] = &cacheattr{
-				pin:      false,
 				accessed: false,
 				deleted:  false,
 			}
@@ -93,13 +90,7 @@ func (c *SieveCache) Set(key string, val *CacheEntry) {
 		c.evictAndInsertInternal(key, val)
 	}
 }
-func (c *SieveCache) SetPin(key string, pin bool) {
-	_, ok := c.cache[key]
-	if ok {
-		c.attr[key].pin = pin
-	}
-}
+
 func (c *SieveCache) Delete(key string) {
 	c.attr[key].deleted = true
-	c.attr[key].pin = false
 }
