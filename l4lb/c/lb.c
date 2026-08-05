@@ -1,6 +1,8 @@
+#define _DEFAULT_SOURCE
 #include <assert.h>
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
+#include <linux/ipv6.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -18,6 +20,7 @@
 
 // We use clang built-in memcpy, but need a function signature to provoke it.
 void* memcpy(void*, const void*, unsigned long);
+int memcmp(const void*, const void*, unsigned long);
 
 #define DEBUG_LB_MAIN 1
 
@@ -49,7 +52,8 @@ struct {
 // lb_config contains the global configuration of the load balancer, which is
 // universal to all flows that it handles.
 struct lb_config { /* go: */
-  uint32_t vip_address;
+  uint32_t vip_address_v4;
+  uint8_t vip_address_v6_byte[16];
   uint32_t num_dests;
 } PACKED;
 
@@ -63,13 +67,14 @@ struct {
 // destination_entry carries a info that is needed to construct an encap packet
 // to the destination.
 struct destination_entry {
-  uint32_t ip_address;
+  uint8_t ip_address_v6_byte[16];
   uint8_t mac_address[ETH_ALEN];
   uint8_t is_alive;
 } PACKED;
 
-struct conn_cache_entry{
-  uint32_t ip_address;
+struct conn_cache_entry {
+  uint32_t ip_address_v4;
+  uint8_t ip_address_v6_byte[16];
   uint16_t port;
 } PACKED;
 
@@ -87,7 +92,14 @@ struct {
   __uint(max_entries, (DESTINATIONS_SIZE + 1));
   __type(key, uint32_t);
   __type(value, struct destination_entry);
-} destinations_map SEC(".maps");
+} destinations_map_ipip6 SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, (DESTINATIONS_SIZE + 1));
+  __type(key, uint32_t);
+  __type(value, struct destination_entry);
+} destinations_map_ip6ip6 SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -154,17 +166,10 @@ static __always_inline uint32_t flow_to_slot(uint32_t src_ip, uint16_t src_port)
 }
 
 SEC("xdp")
-int lb_main(struct xdp_md* ctx) {
-  void* data = (void*)(uint64_t)ctx->data;
-  void* data_end = (void*)(uint64_t)ctx->data_end;
-
+static __always_inline int process_v4v6(struct xdp_md* ctx, u_int8_t isv4) {
   // Get pointer to the `stat_counters`. The stats are stored per CPU,
   // and the driver code will sum them up upon read.
   const uint32_t map_key_zero = 0;
-  struct stat_counters* c = bpf_map_lookup_elem(&stat_counters_map, &map_key_zero);
-  if (!c) {
-    EXIT(XDP_PASS);
-  }
 
   // Get pointer to the `config`. Since the XDP prog can only access BPF maps,
   // we use an BPF map (actually a `BPF_MAP_TYPE_ARRAY`) with a single entry.
@@ -173,38 +178,67 @@ int lb_main(struct xdp_md* ctx) {
     EXIT(XDP_PASS);
   }
 
+  void* destinations_map = (isv4 ? (void*)&destinations_map_ipip6 : (void*)&destinations_map_ip6ip6);
+
   // Lookup ip address and mac address to be used for the source header fields.
-  struct destination_entry* src_entry = bpf_map_lookup_elem(&destinations_map, &map_key_zero);
+  struct destination_entry* src_entry = bpf_map_lookup_elem(destinations_map, &map_key_zero);
   if (!src_entry) {
     EXIT(XDP_PASS);
   }
 
-  // Check if the packet is long enough to contain the headers we need.
-  if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) > data_end) {
-    ++c->too_short_packet_total;
+  struct stat_counters* c = bpf_map_lookup_elem(&stat_counters_map, &map_key_zero);
+  if (!c) {
     EXIT(XDP_PASS);
   }
 
+  void* data = (void*)(uint64_t)ctx->data;
+  void* data_end = (void*)(uint64_t)ctx->data_end;
   struct ethhdr* eth = data;
   struct iphdr* ip = (struct iphdr*)(eth + 1);
+  struct ipv6hdr* ipv6 = (struct ipv6hdr*)(eth + 1);
 
   // Check if the packet is IPv4, has no IP options, is destined to the VIP,
   // and is a TCP packet.
-  if (ip->version != 0x4) {
-    ++c->non_ipv4_packet_total;
-    EXIT(XDP_PASS);
-  }
-  if (ip->ihl != 0x5) {
-    ++c->ip_option_packet_total;
-    EXIT(XDP_PASS);
-  }
-  if (ip->daddr != config->vip_address) {
-    ++c->no_vip_match_total;
-    EXIT(XDP_PASS);
-  }
-  if (ip->protocol != IPPROTO_TCP) {
-    ++c->non_supported_proto_packet_total;
-    EXIT(XDP_PASS);
+
+  if (isv4) {
+    if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) > data_end) {
+      ++c->too_short_packet_total;
+      EXIT(XDP_PASS);
+    }
+    if (ip->version != 0x4) {
+      ++c->non_ipv4_packet_total;
+      EXIT(XDP_PASS);
+    }
+    if (ip->ihl != 0x5) {
+      ++c->ip_option_packet_total;
+      EXIT(XDP_PASS);
+    }
+    if (ip->daddr != config->vip_address_v4) {
+      ++c->no_vip_match_total;
+      EXIT(XDP_PASS);
+    }
+    if (ip->protocol != IPPROTO_TCP) {
+      ++c->non_supported_proto_packet_total;
+      EXIT(XDP_PASS);
+    }
+  } else {
+    if (data + sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct tcphdr) > data_end) {
+      ++c->too_short_packet_total;
+      EXIT(XDP_PASS);
+    }
+    if (ipv6->version != 0x6) {
+      ++c->non_ipv4_packet_total;
+      EXIT(XDP_PASS);
+    }
+
+    if (memcmp(ipv6->daddr.in6_u.u6_addr8, config->vip_address_v6_byte, sizeof(struct in6_addr))) {
+      ++c->no_vip_match_total;
+      EXIT(XDP_PASS);
+    }
+    if (ipv6->nexthdr != IPPROTO_TCP) {
+      ++c->non_supported_proto_packet_total;
+      EXIT(XDP_PASS);
+    }
   }
 
   // Now, we've verified that the packet is a TCP packet destined to the VIP.
@@ -212,42 +246,60 @@ int lb_main(struct xdp_md* ctx) {
   ++c->rx_packet_total;
   c->rx_total_size += data_end - data;
 
-  struct tcphdr* tcp = (struct tcphdr*)(ip + 1);
-
-  debugk("incoming packet: ip=%pI4 port=%u", &ip->saddr, ntohs(tcp->source));
-
+  struct tcphdr* tcp;
   struct conn_cache_entry cache_key;
-  cache_key.ip_address=ip->saddr;
-  cache_key.port=tcp->source;
 
-  uint32_t *dest_idx = bpf_map_lookup_elem(&conn_cache,&cache_key);
-  struct destination_entry* dest;
+  if (isv4) {
+    tcp = (struct tcphdr*)(ip + 1);
 
-  uint8_t valid_cache=0;
-  if(dest_idx){
-    dest = bpf_map_lookup_elem(&destinations_map, dest_idx);
-    if(dest){
-      valid_cache=dest->is_alive;
-      debugk("cache found! dest_idx=%u alive=%u", *dest_idx, valid_cache);
+    debugk("incoming packet: ip=%pI4 port=%u", &ip->saddr, ntohs(tcp->source));
 
-      if(valid_cache){
-        ++c->found_alive_cache_total;
-      }else{
-        ++c->found_dead_cache_total;
-      }
-    }else{
-      debugk("what happened??????????????????????");
-    }
-  }else{
-      ++c->notfound_cache_total;
-      debugk("cache not found!");
+    cache_key.ip_address_v4 = ip->saddr;
+    for (int i = 0; i < 16; i++) cache_key.ip_address_v6_byte[i] = 0;
+    cache_key.port = tcp->source;
+  } else {
+    tcp = (struct tcphdr*)(ipv6 + 1);
+
+    debugk("incoming packet: ip=%pI6 port=%u", &ipv6->saddr, ntohs(tcp->source));
+
+    memcpy(cache_key.ip_address_v6_byte, ipv6->saddr.in6_u.u6_addr8, sizeof(struct in6_addr));
+    cache_key.ip_address_v4 = 0;
+    cache_key.port = tcp->source;
   }
 
-  if(!valid_cache){
-    uint32_t key = flow_to_slot(ip->saddr, tcp->source);
+  uint32_t* dest_idx = bpf_map_lookup_elem(&conn_cache, &cache_key);
+  struct destination_entry* dest;
+
+  uint8_t valid_cache = 0;
+  if (dest_idx) {
+    dest = bpf_map_lookup_elem(destinations_map, dest_idx);
+    if (dest) {
+      valid_cache = dest->is_alive;
+      debugk("cache found! dest_idx=%u alive=%u", *dest_idx, valid_cache);
+
+      if (valid_cache) {
+        ++c->found_alive_cache_total;
+      } else {
+        ++c->found_dead_cache_total;
+      }
+    } else {
+      debugk("what happened??????????????????????");
+    }
+  } else {
+    ++c->notfound_cache_total;
+    debugk("cache not found!");
+  }
+
+  if (!valid_cache) {
+    uint32_t key;
+    if (isv4) {
+      key = flow_to_slot(ip->saddr, tcp->source);
+    } else {
+      key = flow_to_slot(ipv6->saddr.in6_u.u6_addr32[3], tcp->source);
+    }
 
     dest_idx = bpf_map_lookup_elem(&slots_map, &key);
-    if(!dest_idx){
+    if (!dest_idx) {
       bpf_printk("ASSERTION FAILURE: no slot entry for %d", key);
       EXIT(XDP_DROP);
     }
@@ -255,7 +307,7 @@ int lb_main(struct xdp_md* ctx) {
 
     bpf_map_update_elem(&conn_cache, &cache_key, dest_idx, 0);
 
-    dest = bpf_map_lookup_elem(&destinations_map, dest_idx);
+    dest = bpf_map_lookup_elem(destinations_map, dest_idx);
     if (!dest) {
       bpf_printk("ASSERTION FAILURE: no dest entry for %d", dest_idx);
       EXIT(XDP_DROP);
@@ -266,19 +318,19 @@ int lb_main(struct xdp_md* ctx) {
     EXIT(XDP_DROP);
   }
 
-  debugk("dest ip=%pI4", &dest->ip_address);
+  debugk("dest ip=%pI6", dest->ip_address_v6_byte);
   debugk("dest mac=%02x:%02x:%02x", dest->mac_address[0], dest->mac_address[1], dest->mac_address[2]);
   debugk("         %02x:%02x:%02x", dest->mac_address[3], dest->mac_address[4], dest->mac_address[5]);
 
   // make room for the additional IP header (IPIP encapsulation)
-  if (bpf_xdp_adjust_head(ctx, -(int)sizeof(struct iphdr))) {
+  if (bpf_xdp_adjust_head(ctx, -(int)sizeof(struct ipv6hdr))) {
     ++c->failed_adjust_head_total;
     EXIT(XDP_DROP);
   }
 
   // make verifier happy - this is guaranteed by the `bpf_xdp_adjust_head`
   // success, but the verifier is not currently smart enough to know that.
-  if (ctx->data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct iphdr) > ctx->data_end) {
+  if (ctx->data + sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct iphdr) > ctx->data_end) {
     bpf_printk("NOT REACHED!!!");
     EXIT(XDP_DROP);
   }
@@ -286,39 +338,37 @@ int lb_main(struct xdp_md* ctx) {
   // Construct new eth header - the encap packet is from the LB to the
   // destination cache node.
   eth = (void*)(uint64_t)ctx->data;
-  eth->h_proto = htons(ETH_P_IP);
+  eth->h_proto = htons(ETH_P_IPV6);
 
   memcpy(eth->h_source, src_entry->mac_address, sizeof(src_entry->mac_address));
   memcpy(eth->h_dest, dest->mac_address, sizeof(dest->mac_address));
 
   // Construct the IPIP header.
-  struct iphdr* ip2 = (void*)(eth + 1);
+  struct ipv6hdr* ip2_v6 = (void*)(eth + 1);
 
-  ip = (void*)(ip2 + 1);
-  uint16_t iphdr_tot_len = ntohs(ip->tot_len);  // FIXME - should be always fixed.
-
-  ip2->version = 4;
-  ip2->ihl = 0x5;
-  ip2->tos = 0;
-  ip2->tot_len = htons(iphdr_tot_len + sizeof(struct iphdr));
-  ip2->id = ~ip->id;
-  ip2->frag_off = htons(IP_DF);
-  ip2->ttl = 64;
-  ip2->protocol = IPPROTO_IPIP;
-  ip2->check = 0;
-  ip2->saddr = src_entry->ip_address;
-  ip2->daddr = dest->ip_address;
-
-  // Calculate the checksum of the IPIP header.
-  uint32_t sum = 0;
-  for (int i = 0; i < sizeof(struct iphdr) / 2; i++) {
-    sum += ((uint16_t*)ip2)[i];
+  uint16_t inner_length;
+  if (isv4) {
+    ip = (void*)(ip2_v6 + 1);
+    inner_length = ntohs(ip->tot_len);  // FIXME - should be always fixed.
+  } else {
+    ipv6 = (void*)(ip2_v6 + 1);
+    inner_length = ntohs(ipv6->payload_len) + sizeof(struct ipv6hdr);
   }
-  sum = (sum & 0xffff) + (sum >> 16);
-  ip2->check = ~sum;
+
+  ip2_v6->version = 6;
+  ip2_v6->priority = 0;
+  ip2_v6->flow_lbl[0] = 0;
+  ip2_v6->flow_lbl[1] = 0;
+  ip2_v6->flow_lbl[2] = 0;
+  ip2_v6->payload_len = htons(inner_length);
+  ip2_v6->nexthdr = (isv4 ? IPPROTO_IPIP : IPPROTO_IPV6);
+  ip2_v6->hop_limit = 64;
+
+  memcpy(&ip2_v6->saddr, &src_entry->ip_address_v6_byte, sizeof(struct in6_addr));
+  memcpy(&ip2_v6->daddr, &dest->ip_address_v6_byte, sizeof(struct in6_addr));
 
   // Drop padding of the original packet if needed
-  ssize_t padding = ETH_ZLEN - (sizeof(struct ethhdr) + iphdr_tot_len);
+  ssize_t padding = ETH_ZLEN - (sizeof(struct ethhdr) + inner_length);
   if (padding > 0) {
     if (bpf_xdp_adjust_tail(ctx, -padding)) {
       ++c->failed_adjust_tail_total;
@@ -331,6 +381,30 @@ int lb_main(struct xdp_md* ctx) {
   // FIXME: depending on encap_size, it is possible that the encaped needs
   // padding back again too.
   EXIT(XDP_TX);
+}
+
+SEC("xdp")
+int lb_main(struct xdp_md* ctx) {
+  void* data = (void*)(uint64_t)ctx->data;
+  void* data_end = (void*)(uint64_t)ctx->data_end;
+
+  if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) > data_end) {
+    EXIT(XDP_PASS);
+  }
+
+  struct ethhdr* eth = data;
+  struct iphdr* ipv4 = (struct iphdr*)(eth + 1);
+  struct ipv6hdr* ipv6 = (struct ipv6hdr*)(eth + 1);
+
+  if (ipv4->version == 0x4) {
+    int res = process_v4v6(ctx, 1);
+    EXIT(res);
+  } else if (ipv6->version == 0x6) {
+    int res = process_v4v6(ctx, 0);
+    EXIT(res);
+  } else {
+    EXIT(XDP_PASS);
+  }
 }
 
 // see DEBUG_LB_MAIN
