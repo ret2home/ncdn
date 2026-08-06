@@ -1,11 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -13,7 +13,7 @@ import (
 type WaiterEntry struct {
 	ch          chan struct{}
 	resultEntry *CacheEntry
-	resultData  []byte
+	waiter      int
 }
 type CacheServer struct {
 	origin     *url.URL
@@ -45,82 +45,136 @@ func (c *CacheServer) finishLoading(uri string) {
 	delete(c.loading, uri)
 }
 
-func (c *CacheServer) internalNewRequest(w http.ResponseWriter, r *http.Request) {
-	newErrorEntry := func(status int) (*CacheEntry, []byte) {
+func (c *CacheServer) internalNewRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	newErrorEntry := func(status int) *CacheEntry {
 		return &CacheEntry{
 			statusCode: status,
 			header:     make(http.Header),
-		}, []byte(http.StatusText(status) + "\n")
+			path:       "",
+			size:       0,
+			expire:     time.Now(),
+		}
 	}
+
 	uri := r.URL.RequestURI()
 
 	target := c.origin.ResolveReference(r.URL)
-	req, err := http.NewRequest("GET", target.String(), nil)
+	req, err := http.NewRequest(http.MethodGet, target.String(), nil)
 	if err != nil {
 		c.mu.Lock()
-		c.loading[uri].resultEntry, c.loading[uri].resultData = newErrorEntry(http.StatusInternalServerError)
+		c.loading[uri].resultEntry =
+			newErrorEntry(http.StatusInternalServerError)
 		c.finishLoading(uri)
 		c.mu.Unlock()
-		w.WriteHeader(http.StatusInternalServerError)
+
+		http.Error(
+			w,
+			http.StatusText(http.StatusInternalServerError),
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
 	req.Header.Set("X-NCDN-PoPCache-NodeId", c.nodeId)
 
-	prevPopID := r.Header.Get("X-NCDN-PoPCache-NodeId")
-	if prevPopID != "" {
+	if prevPopID := r.Header.Get("X-NCDN-PoPCache-NodeId"); prevPopID != "" {
 		req.Header.Set("X-NCDN-PoPCache-NodeId", prevPopID)
 	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
 		c.mu.Lock()
-		c.loading[uri].resultEntry, c.loading[uri].resultData = newErrorEntry(http.StatusBadGateway)
+		c.loading[uri].resultEntry = newErrorEntry(http.StatusBadGateway)
 		c.finishLoading(uri)
 		c.mu.Unlock()
-		w.WriteHeader(http.StatusBadGateway)
+
+		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	var buf bytes.Buffer
-	reader := io.TeeReader(resp.Body, &buf)
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
+
 	w.Header().Set("X-Cache", "MISS")
 	w.WriteHeader(resp.StatusCode)
-	if _, err = io.Copy(w, reader); err != nil {
-		c.mu.Lock()
-		c.loading[uri].resultEntry, c.loading[uri].resultData = newErrorEntry(http.StatusBadGateway)
-		c.finishLoading(uri)
-		c.mu.Unlock()
-		return
-	}
 
 	path := c.URIToFilePath(uri)
-	if resp.StatusCode == http.StatusOK {
-		err = c.SetFile(path, buf.Bytes())
-	}
+	cacheable := resp.StatusCode == http.StatusOK
 
-	c.mu.Lock()
-	c.loading[uri].resultEntry = &CacheEntry{
-		statusCode: resp.StatusCode,
-		header:     resp.Header,
-		expire:     time.Now().Add(time.Second * 5),
-		size:       uint64(buf.Len()),
-		path:       path,
-	}
-	c.loading[uri].resultData = buf.Bytes()
-	if resp.StatusCode == http.StatusOK {
+	var (
+		tmpfile *os.File
+		tmpPath string
+		dst     io.Writer = w
+	)
+
+	if cacheable {
+		tmpfile, err = os.CreateTemp(filepath.Dir(path), ".tmp-*")
 		if err == nil {
-			c.sievecache.Set(uri, c.loading[uri].resultEntry)
+			tmpPath = tmpfile.Name()
+			dst = io.MultiWriter(w, tmpfile)
 		}
 	}
+
+	written, copyErr := io.CopyBuffer(dst, resp.Body, make([]byte, 64*1024))
+
+	closeOK := false
+	if tmpfile != nil {
+		closeOK = tmpfile.Close() == nil
+	}
+
+	var (
+		result    *CacheEntry
+		committed bool
+	)
+
+	c.mu.Lock()
+
+	flight := c.loading[uri]
+	if copyErr == nil && closeOK && tmpPath != "" {
+		if renameErr := os.Rename(tmpPath, path); renameErr == nil {
+			committed = true
+
+			result = &CacheEntry{
+				statusCode: resp.StatusCode,
+				header:     resp.Header.Clone(),
+				path:       path,
+				size:       written,
+				expire:     time.Now().Add(5 * time.Second),
+			}
+
+			c.sievecache.Set(uri, result)
+			c.sievecache.SetPin(uri, flight.waiter > 0)
+		}
+	}
+
+	if result == nil {
+		switch {
+		case copyErr != nil:
+			result = newErrorEntry(http.StatusBadGateway)
+
+		case resp.StatusCode != http.StatusOK:
+			result = newErrorEntry(resp.StatusCode)
+
+		default:
+			result = newErrorEntry(http.StatusBadGateway)
+		}
+	}
+
+	flight.resultEntry = result
+
 	c.finishLoading(uri)
 	c.mu.Unlock()
+
+	if !committed && tmpPath != "" {
+		_ = os.Remove(tmpPath)
+	}
 }
 
 func internalServeCache(vent *CacheEntry, file *os.File, w http.ResponseWriter, XCache string) {
@@ -134,7 +188,7 @@ func internalServeCache(vent *CacheEntry, file *os.File, w http.ResponseWriter, 
 	w.WriteHeader(vent.statusCode)
 	io.Copy(w, file)
 }
-func internalServeData(vent *CacheEntry, data []byte, w http.ResponseWriter, XCache string) {
+func internalServeData(vent *CacheEntry, w http.ResponseWriter, XCache string) {
 	for key, values := range vent.header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -142,7 +196,6 @@ func internalServeData(vent *CacheEntry, data []byte, w http.ResponseWriter, XCa
 	}
 	w.Header().Set("X-Cache", XCache)
 	w.WriteHeader(vent.statusCode)
-	w.Write(data)
 }
 
 // NOT_LOADED : !cache && !loading
@@ -175,25 +228,41 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.loading[uri] = &WaiterEntry{
 			ch:          make(chan struct{}),
 			resultEntry: nil,
+			waiter:      0,
 		}
 	} else if hit_clean {
 		file, err := os.Open(cacheent.path)
-		c.mu.Unlock()
-
 		if err != nil {
 			c.sievecache.Delete(uri)
+			c.mu.Unlock()
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+
+		c.mu.Unlock()
 		internalServeCache(cacheent, file, w, "HIT")
 		return
+	} else if waiting {
+		waiter_entry.waiter++
 	}
 	c.mu.Unlock()
 
 	if waiting {
 		<-waiter_entry.ch
 
-		internalServeData(waiter_entry.resultEntry, waiter_entry.resultData, w, "COLLAPSED")
+		c.mu.Lock()
+		file, err := os.Open(waiter_entry.resultEntry.path)
+		waiter_entry.waiter--
+		if waiter_entry.waiter == 0 {
+			c.sievecache.SetPin(uri, false)
+		}
+		c.mu.Unlock()
+
+		if err == nil {
+			internalServeCache(waiter_entry.resultEntry, file, w, "COLLAPSED")
+		} else {
+			internalServeData(waiter_entry.resultEntry, w, "COLLAPSED")
+		}
 		return
 	}
 	c.internalNewRequest(w, r)

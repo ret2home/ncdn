@@ -12,12 +12,13 @@ type CacheEntry struct {
 	statusCode int
 	header     http.Header
 	path       string
-	size       uint64
+	size       int64
 	expire     time.Time
 }
 type cacheattr struct {
 	deleted  bool
 	accessed bool
+	pin      bool
 }
 
 type SieveCache struct {
@@ -49,6 +50,7 @@ func (c *SieveCache) insertInternal(key string, ent *CacheEntry) {
 	c.attr[key] = &cacheattr{
 		accessed: false,
 		deleted:  false,
+		pin:      false,
 	}
 	c.list.InsertFront(key)
 	c.size++
@@ -63,7 +65,7 @@ func (c *SieveCache) evict(e *ListEntry) {
 func (c *SieveCache) evictOne() {
 	for {
 		key := c.list.hand.val
-		if c.attr[key].deleted || !c.attr[key].accessed {
+		if (c.attr[key].deleted || !c.attr[key].accessed) && !c.attr[key].pin {
 			c.evict(c.list.hand)
 			return
 		}
@@ -87,6 +89,7 @@ func (c *SieveCache) Set(key string, ent *CacheEntry) {
 			c.attr[key] = &cacheattr{
 				accessed: false,
 				deleted:  false,
+				pin:      false,
 			}
 		}
 	} else {
@@ -96,4 +99,10 @@ func (c *SieveCache) Set(key string, ent *CacheEntry) {
 
 func (c *SieveCache) Delete(key string) {
 	c.attr[key].deleted = true
+}
+func (c *SieveCache) SetPin(key string, pin bool) {
+	v, ok := c.attr[key]
+	if ok {
+		v.pin = pin
+	}
 }
