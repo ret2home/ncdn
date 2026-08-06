@@ -11,10 +11,10 @@ type CacheEntry struct {
 	header     http.Header
 	path       string
 	size       int64
-	expire     time.Time
+	saveTime   time.Time
+	cc         *ResponseCacheControl
 }
 type cacheattr struct {
-	deleted  bool
 	accessed bool
 	pin      bool
 }
@@ -38,7 +38,7 @@ func NewSieveCache(maxEntries uint32) *SieveCache {
 }
 func (c *SieveCache) Get(key string) (*CacheEntry, bool) {
 	v, ok := c.cache[key]
-	if ok && !c.attr[key].deleted {
+	if ok {
 		c.attr[key].accessed = true
 		return v, true
 	} else {
@@ -50,7 +50,6 @@ func (c *SieveCache) insertInternal(key string, ent *CacheEntry) {
 	c.cache[key] = ent
 	c.attr[key] = &cacheattr{
 		accessed: false,
-		deleted:  false,
 		pin:      false,
 	}
 	c.list.InsertFront(key)
@@ -66,11 +65,13 @@ func (c *SieveCache) evict(e *ListEntry) {
 func (c *SieveCache) evictOne() bool {
 	for i := 0; i < int(c.size)*2; i++ {
 		key := c.list.hand.val
-		if (c.attr[key].deleted || !c.attr[key].accessed) && !c.attr[key].pin {
+		if !c.attr[key].accessed && !c.attr[key].pin {
 			c.evict(c.list.hand)
 			return true
 		}
-		c.attr[key].accessed = false
+		if !c.attr[key].pin {
+			c.attr[key].accessed = false
+		}
 		c.list.MoveHand()
 	}
 	return false
@@ -91,12 +92,9 @@ func (c *SieveCache) Set(key string, ent *CacheEntry) bool {
 	_, ok := c.cache[key]
 	if ok {
 		c.cache[key] = ent
-		if c.attr[key].deleted {
-			c.attr[key] = &cacheattr{
-				accessed: false,
-				deleted:  false,
-				pin:      false,
-			}
+		c.attr[key] = &cacheattr{
+			accessed: false,
+			pin:      false,
 		}
 		return true
 	} else {
@@ -112,20 +110,9 @@ func (c *SieveCache) MakeRoom(key string) bool {
 	}
 }
 
-func (c *SieveCache) Delete(key string) {
-	c.attr[key].deleted = true
-}
 func (c *SieveCache) SetPin(key string, pin bool) {
 	v, ok := c.attr[key]
 	if ok {
 		v.pin = pin
 	}
-}
-func (c *SieveCache) SetPinIfSame(key string, expected *CacheEntry, pin bool) {
-	current, ok := c.cache[key]
-	if !ok || current != expected {
-		return
-	}
-
-	c.attr[key].pin = pin
 }

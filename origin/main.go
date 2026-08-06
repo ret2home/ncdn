@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/yzp0n/ncdn/httprps"
 )
@@ -43,6 +44,7 @@ func serveIndexHTMLInternal(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Cache-Control", "max-age=60, stale-while-validate=120, stale-if-error=180")
 	_, err = w.Write(buf.Bytes())
 	if err != nil {
 		log.Printf("Failed to write response: %v", err)
@@ -83,18 +85,27 @@ func serveJson(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
-
+func withCacheControl(next http.Handler, value string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", value)
+		next.ServeHTTP(w, r)
+	})
+}
 func main() {
 	flag.Parse()
 
-	fs := http.FileServer(http.Dir("./static"))
+	fs := withCacheControl(
+		http.FileServer(http.Dir("./static")),
+		"public, max-age=3600",
+	)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/number/{num}", func(w http.ResponseWriter, r *http.Request) {
 		num := r.PathValue("num")
 		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Cache-Control", "max-age=5, stale-while-revalidate=15, stale-if-error=60")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Hello %s\n", num)
+		fmt.Fprintf(w, "Hello %s\nDate: %s\n", num, time.Now().String())
 	})
 	mux.HandleFunc("/index.html", serveIndexHTML)
 	mux.HandleFunc("/json", serveJson)

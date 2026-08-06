@@ -25,7 +25,7 @@ mac_lb=$(sudo ip netns exec LB cat /sys/class/net/net0/address)
 dests_ipip6="${ip6s[0]};${mac_lb},"
 dests_ip6ip6="${ip6s[0]};${mac_lb},"
 
-for ns in C0 C1 C2; do
+for ns in C0; do
     mapfile -t ip6s < <(
         sudo ip netns exec "$ns" ip -json -f inet6 a show net0 |
         jq -r '.[].addr_info[].local | select(startswith("fd6e:"))' |
