@@ -30,7 +30,11 @@ type CacheServer struct {
 }
 
 func NewCacheServer(origin *url.URL, nodeId string) *CacheServer {
-	if err := os.MkdirAll("/tmp/cache-"+nodeId, 0o755); err != nil {
+	cacheDir := "/tmp/cache-" + nodeId
+	if err := os.RemoveAll(cacheDir); err != nil {
+		panic(err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		panic(err)
 	}
 	transport := &http.Transport{
@@ -83,7 +87,13 @@ func (c *CacheServer) internalNewRequest(
 		}
 	}
 
-	target := c.origin.ResolveReference(r.URL)
+	reference := &url.URL{
+		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
+		RawQuery: r.URL.RawQuery,
+	}
+
+	target := c.origin.ResolveReference(reference)
 	req, err := http.NewRequest(http.MethodGet, target.String(), nil)
 	if err != nil {
 		c.mu.Lock()
@@ -92,11 +102,13 @@ func (c *CacheServer) internalNewRequest(
 		c.finishLoading(uri_key)
 		c.mu.Unlock()
 
-		http.Error(
-			w,
-			http.StatusText(http.StatusInternalServerError),
-			http.StatusInternalServerError,
-		)
+		if w != nil {
+			http.Error(
+				w,
+				http.StatusText(http.StatusInternalServerError),
+				http.StatusInternalServerError,
+			)
+		}
 		return
 	}
 
@@ -113,34 +125,42 @@ func (c *CacheServer) internalNewRequest(
 		c.finishLoading(uri_key)
 		c.mu.Unlock()
 
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		if w != nil {
+			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		}
 		return
 	}
 	defer resp.Body.Close()
 
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
+	if w != nil {
+		for key, values := range resp.Header {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
 		}
+
+		w.Header().Set("X-Cache", "MISS")
+		w.WriteHeader(resp.StatusCode)
 	}
 
-	w.Header().Set("X-Cache", "MISS")
-	w.WriteHeader(resp.StatusCode)
-
 	path := c.URIToFilePath(uri_key)
-	savable := resp.StatusCode == http.StatusOK
-
 	var (
 		tmpfile *os.File
 		tmpPath string
-		dst     io.Writer = w
+		dst     io.Writer = io.Discard
 	)
 
-	if savable {
-		tmpfile, err = os.CreateTemp(filepath.Dir(path), ".tmp-*")
-		if err == nil {
-			tmpPath = tmpfile.Name()
+	if w != nil {
+		dst = w
+	}
+
+	tmpfile, err = os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err == nil {
+		tmpPath = tmpfile.Name()
+		if w != nil {
 			dst = io.MultiWriter(w, tmpfile)
+		} else {
+			dst = tmpfile
 		}
 	}
 
@@ -163,7 +183,7 @@ func (c *CacheServer) internalNewRequest(
 
 	if copyErr == nil && closeOK && tmpPath != "" {
 
-		cacheable := written < c.maxFileSize && c.sievecache.MakeRoom(uri_key)
+		cacheable := resp.StatusCode == http.StatusOK && written < c.maxFileSize && c.sievecache.MakeRoom(uri_key)
 
 		result = &CacheEntry{
 			statusCode: resp.StatusCode,
@@ -188,8 +208,6 @@ func (c *CacheServer) internalNewRequest(
 			if flight.waiter == 0 {
 				removePath = tmpPath
 			}
-		} else {
-			removePath = tmpPath
 		}
 	}
 
