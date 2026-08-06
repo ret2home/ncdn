@@ -92,10 +92,6 @@ func (c *SieveCache) Set(key string, ent *CacheEntry) bool {
 	_, ok := c.cache[key]
 	if ok {
 		c.cache[key] = ent
-		c.attr[key] = &cacheattr{
-			accessed: false,
-			pin:      false,
-		}
 		return true
 	} else {
 		return c.evictAndInsertInternal(key, ent)

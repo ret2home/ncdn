@@ -437,12 +437,12 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				c.latestWaiterEntries[uri_key] = waiter_entry
 			}
 			c.mu.Unlock()
-			internalServeCache(cacheent, file, w, "STALE")
 
 			// COLLAPSE
 			if !loading_flag {
 				go c.internalNewRequest(waiter_entry, uri_key, nil, r)
 			}
+			internalServeCache(cacheent, file, w, "STALE")
 		}
 		return
 	} else if collapsed {

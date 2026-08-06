@@ -44,7 +44,7 @@ func serveIndexHTMLInternal(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	w.Header().Set("Content-Type", "text/html")
-	w.Header().Set("Cache-Control", "max-age=60, stale-while-validate=120, stale-if-error=180")
+	w.Header().Set("Cache-Control", "max-age=60, stale-while-revalidate=120, stale-if-error=180")
 	_, err = w.Write(buf.Bytes())
 	if err != nil {
 		log.Printf("Failed to write response: %v", err)
