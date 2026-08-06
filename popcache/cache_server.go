@@ -33,7 +33,7 @@ type CacheServer struct {
 	waiterCount         map[string]int
 	client              *http.Client
 	nodeId              string
-	mu                  sync.RWMutex
+	mu                  sync.Mutex
 	maxFileSize         int64
 }
 
@@ -90,9 +90,6 @@ func (c *CacheServer) internalNewRequest(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
-	c.mu.Lock()
-	c.AddWaiterCount(uri_key)
-	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
 		c.SubWaiterCount(uri_key)
@@ -146,6 +143,8 @@ func (c *CacheServer) internalNewRequest(
 
 	resp, err := c.client.Do(req)
 
+	req_cc := ParseRequestCacheControl(r.Header.Values("Cache-Control"))
+
 	// STALE IF ERROR
 	if err != nil || resp.StatusCode == 500 || resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 504 {
 		if err == nil {
@@ -156,7 +155,7 @@ func (c *CacheServer) internalNewRequest(
 		cacheent, cachehit := c.sievecache.Get(uri_key)
 
 		staleFlag := false
-		if cachehit && cacheent.cc.StaleIfError != -1 && !cacheent.cc.MustRevalidate && !cacheent.cc.NoCache && cacheent.cc.MaxAge != -1 {
+		if cachehit && cacheent.cc.StaleIfError != -1 && !cacheent.cc.MustRevalidate && !cacheent.cc.NoCache && !req_cc.NoCache && cacheent.cc.MaxAge != -1 {
 			fresh := cacheent.saveTime.Add(time.Second * time.Duration(cacheent.cc.MaxAge))
 			if fresh.Add(time.Second * time.Duration(cacheent.cc.StaleIfError)).After(time.Now()) {
 				staleFlag = true
@@ -171,12 +170,14 @@ func (c *CacheServer) internalNewRequest(
 			cacheFile, cacheFileOpenError = os.Open(cacheent.path)
 		}
 
+		returnStatusCode := http.StatusBadGateway
+		if err == nil {
+			returnStatusCode = resp.StatusCode
+		}
 		if staleFlag {
 			waiter_entry.resultEntry = cacheent
-		} else if err != nil {
-			waiter_entry.resultEntry = newErrorEntry(http.StatusBadGateway)
 		} else {
-			waiter_entry.resultEntry = newErrorEntry(resp.StatusCode)
+			waiter_entry.resultEntry = newErrorEntry(returnStatusCode)
 		}
 		c.finishLoading(waiter_entry)
 
@@ -191,7 +192,7 @@ func (c *CacheServer) internalNewRequest(
 				}
 				internalServeCache(cacheent, cacheFile, w, "STALE")
 			} else {
-				http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+				http.Error(w, http.StatusText(returnStatusCode), returnStatusCode)
 			}
 		}
 		return
@@ -203,7 +204,6 @@ func (c *CacheServer) internalNewRequest(
 	}
 
 	resp_cc := ParseResponseCacheControl(resp.Header.Values("Cache-Control"))
-	req_cc := ParseRequestCacheControl(r.Header.Values("Cache-Control"))
 
 	if w != nil {
 		for key, values := range resp.Header {
@@ -411,6 +411,7 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			waiter:      0,
 			isTmpFile:   false,
 		}
+		c.AddWaiterCount(uri_key)
 		c.latestWaiterEntries[uri_key] = waiter_entry
 	} else if returnCache {
 		file, err := os.Open(cacheent.path)
@@ -433,7 +434,7 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					waiter:      0,
 					isTmpFile:   false,
 				}
-
+				c.AddWaiterCount(uri_key)
 				c.latestWaiterEntries[uri_key] = waiter_entry
 			}
 			c.mu.Unlock()
