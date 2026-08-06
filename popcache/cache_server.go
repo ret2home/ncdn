@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,28 +17,48 @@ type WaiterEntry struct {
 	ch          chan struct{}
 	resultEntry *CacheEntry
 	waiter      int
+	isTmpFile   bool
 }
 type CacheServer struct {
-	origin     *url.URL
-	sievecache SieveCache
-	loading    map[string]*WaiterEntry
-	client     *http.Client
-	nodeId     string
-	mu         sync.RWMutex
+	origin      *url.URL
+	sievecache  SieveCache
+	loading     map[string]*WaiterEntry
+	client      *http.Client
+	nodeId      string
+	mu          sync.RWMutex
+	maxFileSize int64
 }
 
 func NewCacheServer(origin *url.URL, nodeId string) *CacheServer {
 	if err := os.MkdirAll("/tmp/cache-"+nodeId, 0o755); err != nil {
 		panic(err)
 	}
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+
+		MaxIdleConns:        1024,
+		MaxIdleConnsPerHost: 256,
+
+		MaxConnsPerHost: 256,
+
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
 	cs := CacheServer{
 		origin:     origin,
-		sievecache: *NewSieveCache(),
+		sievecache: *NewSieveCache(1 << 10),
 		loading:    map[string]*WaiterEntry{},
 		client: &http.Client{
-			Timeout: 5 * time.Second,
+			Transport: transport,
+			Timeout:   0,
 		},
-		nodeId: nodeId,
+		nodeId:      nodeId,
+		maxFileSize: 16 * (1 << 20), // 16MB
 	}
 	return &cs
 }
@@ -106,7 +129,7 @@ func (c *CacheServer) internalNewRequest(
 	w.WriteHeader(resp.StatusCode)
 
 	path := c.URIToFilePath(uri)
-	cacheable := resp.StatusCode == http.StatusOK
+	savable := resp.StatusCode == http.StatusOK
 
 	var (
 		tmpfile *os.File
@@ -114,7 +137,7 @@ func (c *CacheServer) internalNewRequest(
 		dst     io.Writer = w
 	)
 
-	if cacheable {
+	if savable {
 		tmpfile, err = os.CreateTemp(filepath.Dir(path), ".tmp-*")
 		if err == nil {
 			tmpPath = tmpfile.Name()
@@ -130,40 +153,66 @@ func (c *CacheServer) internalNewRequest(
 	}
 
 	var (
-		result    *CacheEntry
-		committed bool
+		result     *CacheEntry
+		committed  bool
+		removePath string
 	)
 
 	c.mu.Lock()
 
 	flight := c.loading[uri]
+
 	if copyErr == nil && closeOK && tmpPath != "" {
-		if renameErr := os.Rename(tmpPath, path); renameErr == nil {
-			committed = true
 
-			result = &CacheEntry{
-				statusCode: resp.StatusCode,
-				header:     resp.Header.Clone(),
-				path:       path,
-				size:       written,
-				expire:     time.Now().Add(5 * time.Second),
+		cacheable := written < c.maxFileSize && c.sievecache.MakeRoom(uri)
+
+		result = &CacheEntry{
+			statusCode: resp.StatusCode,
+			header:     resp.Header.Clone(),
+			path:       path,
+			size:       written,
+			expire:     time.Now().Add(5 * time.Second),
+		}
+
+		if cacheable {
+			if renameErr := os.Rename(tmpPath, path); renameErr == nil {
+				if c.sievecache.Set(uri, result) { // shoule be always ok
+					c.sievecache.SetPin(uri, flight.waiter > 0)
+					committed = true
+				}
 			}
+		}
 
-			c.sievecache.Set(uri, result)
-			c.sievecache.SetPin(uri, flight.waiter > 0)
+		if !committed {
+			result.path = tmpPath
+			flight.isTmpFile = true
+			if flight.waiter == 0 {
+				removePath = tmpPath
+			}
+		} else {
+			removePath = tmpPath
 		}
 	}
 
 	if result == nil {
 		switch {
 		case copyErr != nil:
-			result = newErrorEntry(http.StatusBadGateway)
+			{
+				result = newErrorEntry(http.StatusBadGateway)
+				slog.Error(fmt.Sprintf("copy error: %v", copyErr))
+			}
 
 		case resp.StatusCode != http.StatusOK:
-			result = newErrorEntry(resp.StatusCode)
+			{
+				result = newErrorEntry(resp.StatusCode)
+				slog.Error(fmt.Sprintf("status code: %d", resp.StatusCode))
+			}
 
 		default:
-			result = newErrorEntry(http.StatusBadGateway)
+			{
+				result = newErrorEntry(http.StatusBadGateway)
+				slog.Error("unknown bad gateway")
+			}
 		}
 	}
 
@@ -172,8 +221,8 @@ func (c *CacheServer) internalNewRequest(
 	c.finishLoading(uri)
 	c.mu.Unlock()
 
-	if !committed && tmpPath != "" {
-		_ = os.Remove(tmpPath)
+	if removePath != "" {
+		_ = os.Remove(removePath)
 	}
 }
 
@@ -229,6 +278,7 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ch:          make(chan struct{}),
 			resultEntry: nil,
 			waiter:      0,
+			isTmpFile:   false,
 		}
 	} else if hit_clean {
 		file, err := os.Open(cacheent.path)
@@ -254,14 +304,19 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		file, err := os.Open(waiter_entry.resultEntry.path)
 		waiter_entry.waiter--
 		if waiter_entry.waiter == 0 {
-			c.sievecache.SetPin(uri, false)
+			c.sievecache.SetPinIfSame(uri, waiter_entry.resultEntry, false)
 		}
+		removeFile := waiter_entry.waiter == 0 && waiter_entry.isTmpFile
 		c.mu.Unlock()
 
 		if err == nil {
 			internalServeCache(waiter_entry.resultEntry, file, w, "COLLAPSED")
 		} else {
 			internalServeData(waiter_entry.resultEntry, w, "COLLAPSED")
+		}
+
+		if removeFile {
+			os.Remove(waiter_entry.resultEntry.path)
 		}
 		return
 	}

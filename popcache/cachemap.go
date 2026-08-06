@@ -6,8 +6,6 @@ import (
 	"time"
 )
 
-const MAXSIZE = 1024
-
 type CacheEntry struct {
 	statusCode int
 	header     http.Header
@@ -22,17 +20,20 @@ type cacheattr struct {
 }
 
 type SieveCache struct {
-	cache map[string]*CacheEntry
-	attr  map[string]*cacheattr
-	list  *LinkList
-	size  uint32
+	cache           map[string]*CacheEntry
+	attr            map[string]*cacheattr
+	list            *LinkList
+	size            uint32
+	maxCacheEntries uint32
 }
 
-func NewSieveCache() *SieveCache {
+func NewSieveCache(maxEntries uint32) *SieveCache {
 	return &SieveCache{
-		cache: map[string]*CacheEntry{},
-		attr:  map[string]*cacheattr{},
-		list:  NewList(),
+		cache:           map[string]*CacheEntry{},
+		attr:            map[string]*cacheattr{},
+		list:            NewList(),
+		size:            0,
+		maxCacheEntries: maxEntries,
 	}
 }
 func (c *SieveCache) Get(key string) (*CacheEntry, bool) {
@@ -62,26 +63,31 @@ func (c *SieveCache) evict(e *ListEntry) {
 	c.size--
 	c.list.Remove(e)
 }
-func (c *SieveCache) evictOne() {
-	for {
+func (c *SieveCache) evictOne() bool {
+	for i := 0; i < int(c.size)*2; i++ {
 		key := c.list.hand.val
 		if (c.attr[key].deleted || !c.attr[key].accessed) && !c.attr[key].pin {
 			c.evict(c.list.hand)
-			return
+			return true
 		}
 		c.attr[key].accessed = false
 		c.list.MoveHand()
 	}
+	return false
 }
-func (c *SieveCache) evictAndInsertInternal(key string, ent *CacheEntry) {
-	if c.size < MAXSIZE {
+func (c *SieveCache) evictAndInsertInternal(key string, ent *CacheEntry) bool {
+	if c.size < c.maxCacheEntries {
 		c.insertInternal(key, ent)
+		return true
 	} else {
-		c.evictOne()
-		c.insertInternal(key, ent)
+		if c.evictOne() {
+			c.insertInternal(key, ent)
+			return true
+		}
+		return false
 	}
 }
-func (c *SieveCache) Set(key string, ent *CacheEntry) {
+func (c *SieveCache) Set(key string, ent *CacheEntry) bool {
 	_, ok := c.cache[key]
 	if ok {
 		c.cache[key] = ent
@@ -92,8 +98,17 @@ func (c *SieveCache) Set(key string, ent *CacheEntry) {
 				pin:      false,
 			}
 		}
+		return true
 	} else {
-		c.evictAndInsertInternal(key, ent)
+		return c.evictAndInsertInternal(key, ent)
+	}
+}
+func (c *SieveCache) MakeRoom(key string) bool {
+	_, ok := c.cache[key]
+	if ok || c.size < c.maxCacheEntries {
+		return true
+	} else {
+		return c.evictOne()
 	}
 }
 
@@ -105,4 +120,12 @@ func (c *SieveCache) SetPin(key string, pin bool) {
 	if ok {
 		v.pin = pin
 	}
+}
+func (c *SieveCache) SetPinIfSame(key string, expected *CacheEntry, pin bool) {
+	current, ok := c.cache[key]
+	if !ok || current != expected {
+		return
+	}
+
+	c.attr[key].pin = pin
 }
