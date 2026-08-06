@@ -69,6 +69,7 @@ func (c *CacheServer) finishLoading(uri string) {
 }
 
 func (c *CacheServer) internalNewRequest(
+	uri_key string,
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
@@ -82,15 +83,13 @@ func (c *CacheServer) internalNewRequest(
 		}
 	}
 
-	uri := r.URL.RequestURI()
-
 	target := c.origin.ResolveReference(r.URL)
 	req, err := http.NewRequest(http.MethodGet, target.String(), nil)
 	if err != nil {
 		c.mu.Lock()
-		c.loading[uri].resultEntry =
+		c.loading[uri_key].resultEntry =
 			newErrorEntry(http.StatusInternalServerError)
-		c.finishLoading(uri)
+		c.finishLoading(uri_key)
 		c.mu.Unlock()
 
 		http.Error(
@@ -110,8 +109,8 @@ func (c *CacheServer) internalNewRequest(
 	resp, err := c.client.Do(req)
 	if err != nil {
 		c.mu.Lock()
-		c.loading[uri].resultEntry = newErrorEntry(http.StatusBadGateway)
-		c.finishLoading(uri)
+		c.loading[uri_key].resultEntry = newErrorEntry(http.StatusBadGateway)
+		c.finishLoading(uri_key)
 		c.mu.Unlock()
 
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
@@ -128,7 +127,7 @@ func (c *CacheServer) internalNewRequest(
 	w.Header().Set("X-Cache", "MISS")
 	w.WriteHeader(resp.StatusCode)
 
-	path := c.URIToFilePath(uri)
+	path := c.URIToFilePath(uri_key)
 	savable := resp.StatusCode == http.StatusOK
 
 	var (
@@ -160,11 +159,11 @@ func (c *CacheServer) internalNewRequest(
 
 	c.mu.Lock()
 
-	flight := c.loading[uri]
+	flight := c.loading[uri_key]
 
 	if copyErr == nil && closeOK && tmpPath != "" {
 
-		cacheable := written < c.maxFileSize && c.sievecache.MakeRoom(uri)
+		cacheable := written < c.maxFileSize && c.sievecache.MakeRoom(uri_key)
 
 		result = &CacheEntry{
 			statusCode: resp.StatusCode,
@@ -176,8 +175,8 @@ func (c *CacheServer) internalNewRequest(
 
 		if cacheable {
 			if renameErr := os.Rename(tmpPath, path); renameErr == nil {
-				if c.sievecache.Set(uri, result) { // shoule be always ok
-					c.sievecache.SetPin(uri, flight.waiter > 0)
+				if c.sievecache.Set(uri_key, result) { // shoule be always ok
+					c.sievecache.SetPin(uri_key, flight.waiter > 0)
 					committed = true
 				}
 			}
@@ -218,7 +217,7 @@ func (c *CacheServer) internalNewRequest(
 
 	flight.resultEntry = result
 
-	c.finishLoading(uri)
+	c.finishLoading(uri_key)
 	c.mu.Unlock()
 
 	if removePath != "" {
@@ -256,10 +255,15 @@ func internalServeData(vent *CacheEntry, w http.ResponseWriter, XCache string) {
 // FIXME: OK_RETURNING が長引くと expire 判定が遅くなる可能性がある
 
 func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	uri := r.URL.RequestURI()
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	uri_key := r.Host + "\x00" + r.URL.RequestURI()
 	c.mu.Lock()
-	cacheent, cachehit := c.sievecache.Get(uri)
-	waiter_entry, loading_flag := c.loading[uri]
+	cacheent, cachehit := c.sievecache.Get(uri_key)
+	waiter_entry, loading_flag := c.loading[uri_key]
 
 	not_loaded := !cachehit && !loading_flag
 	waiting := !cachehit && loading_flag
@@ -267,14 +271,14 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// HIT_CLEAN -> NOT_LOADED
 	if hit_clean && time.Now().After(cacheent.expire) {
-		c.sievecache.Delete(uri)
+		c.sievecache.Delete(uri_key)
 		hit_clean = false
 		not_loaded = true
 	}
 
 	if not_loaded {
 		// NOT_LOADED -> WAITING
-		c.loading[uri] = &WaiterEntry{
+		c.loading[uri_key] = &WaiterEntry{
 			ch:          make(chan struct{}),
 			resultEntry: nil,
 			waiter:      0,
@@ -283,7 +287,7 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if hit_clean {
 		file, err := os.Open(cacheent.path)
 		if err != nil {
-			c.sievecache.Delete(uri)
+			c.sievecache.Delete(uri_key)
 			c.mu.Unlock()
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -304,7 +308,7 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		file, err := os.Open(waiter_entry.resultEntry.path)
 		waiter_entry.waiter--
 		if waiter_entry.waiter == 0 {
-			c.sievecache.SetPinIfSame(uri, waiter_entry.resultEntry, false)
+			c.sievecache.SetPinIfSame(uri_key, waiter_entry.resultEntry, false)
 		}
 		removeFile := waiter_entry.waiter == 0 && waiter_entry.isTmpFile
 		c.mu.Unlock()
@@ -320,5 +324,5 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	c.internalNewRequest(w, r)
+	c.internalNewRequest(uri_key, w, r)
 }
