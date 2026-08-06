@@ -139,11 +139,14 @@ func (c *CacheServer) internalNewRequest(
 
 	req.Header.Set("X-NCDN-PoPCache-NodeId", c.nodeId)
 
+	// For Shield PoP
 	if prevPopID := r.Header.Get("X-NCDN-PoPCache-NodeId"); prevPopID != "" {
 		req.Header.Set("X-NCDN-PoPCache-NodeId", prevPopID)
 	}
 
 	resp, err := c.client.Do(req)
+
+	// STALE IF ERROR
 	if err != nil || resp.StatusCode == 500 || resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 504 {
 		if err == nil {
 			defer resp.Body.Close()
@@ -226,6 +229,7 @@ func (c *CacheServer) internalNewRequest(
 		dst = w
 	}
 
+	// リクエストとキャッシュに書き込む
 	tmpfile, err = os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err == nil {
 		tmpPath = tmpfile.Name()
@@ -252,6 +256,8 @@ func (c *CacheServer) internalNewRequest(
 	c.mu.Lock()
 
 	if copyErr == nil && closeOK && tmpPath != "" {
+
+		// 事前に eviction しておく
 
 		cacheable := resp.StatusCode == http.StatusOK && !resp_cc.NoStore && !req_cc.NoStore && resp_cc.MaxAge != -1 &&
 			written < c.maxFileSize && c.sievecache.MakeRoom(uri_key)
@@ -356,13 +362,11 @@ func (c *CacheServer) SubWaiterCount(uri_key string) {
 	}
 }
 
-// NOT_LOADED : !cache && !loading
-// WAITING    : !cache && loading
-// HIT_CLEAN  :  cache && !loading
-
-// NOT_LOADED -> WAITING -> OK_RETURNING -> HIT_CLEAN -> NOT_LOADED
-//                       -> NG_RETURNING -> NOT_LOADED
-// FIXME: OK_RETURNING が長引くと expire 判定が遅くなる可能性がある
+// Request ごとに Waiter Entry を作成し，Request Collapse する場合は entry の channel で待たせる
+// Waiter Entry ごと，URI ごとに counter がある
+// Waiter Entry Counter: Cache に保存しない Collapse 側通知用の一時ファイルの寿命管理　待ち collapsed requests を数える
+// URI Counter: SIEVE Cache で eviction を避ける pin を付ける用　Cache Hit 以外の in-flight requests を数える
+// SIEVE Cache, Waiter Count, cache file を操作する場合は Lock が必要
 
 func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -400,7 +404,6 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	returnCache := !wantLoad
 
 	if new_load {
-		// NOT_LOADED -> WAITING
 		waiter_entry = &WaiterEntry{
 			uri_key:     uri_key,
 			ch:          make(chan struct{}),
@@ -421,6 +424,7 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			c.mu.Unlock()
 			internalServeCache(cacheent, file, w, "HIT")
 		} else {
+			// STALE WHILE REVALIDATE
 			if !loading_flag {
 				waiter_entry = &WaiterEntry{
 					uri_key:     uri_key,
@@ -453,8 +457,6 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.mu.Lock()
 		file, err := os.Open(waiter_entry.resultEntry.path)
 		waiter_entry.waiter--
-
-		slog.Info("waiter count: %s %d", uri_key, c.waiterCount[uri_key])
 		c.SubWaiterCount(uri_key)
 		removeFile := waiter_entry.waiter == 0 && waiter_entry.isTmpFile
 		c.mu.Unlock()
