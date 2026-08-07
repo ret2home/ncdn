@@ -206,7 +206,7 @@ func (c *CacheServer) internalNewRequest(
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		slog.Error(fmt.Sprintf("status %d\n", resp.StatusCode))
+		slog.Error(fmt.Sprintf("status %s %d\n", cacheKey, resp.StatusCode))
 	}
 
 	resp_cc := ParseResponseCacheControl(resp.Header.Values("Cache-Control"))
@@ -302,19 +302,19 @@ func (c *CacheServer) internalNewRequest(
 		case copyErr != nil:
 			{
 				result = newErrorEntry(http.StatusBadGateway)
-				slog.Error(fmt.Sprintf("Copy Error: %v", copyErr))
+				slog.Error(fmt.Sprintf("Copy Error: %s %v", cacheKey, copyErr))
 			}
 
 		case resp.StatusCode != http.StatusOK:
 			{
 				result = newErrorEntry(resp.StatusCode)
-				slog.Error(fmt.Sprintf("Error: status %d", resp.StatusCode))
+				slog.Error(fmt.Sprintf("Error: status %s %d", cacheKey, resp.StatusCode))
 			}
 
 		default:
 			{
 				result = newErrorEntry(http.StatusBadGateway)
-				slog.Error("Unknown Bad Gateway")
+				slog.Error(fmt.Sprintf("Unknown Bad Gateway %s", cacheKey))
 			}
 		}
 	}
@@ -450,9 +450,82 @@ func (c *CacheServer) DecideTypeOfLoad(cacheKey string, cc *RequestCacheControl)
 // URI Counter: SIEVE Cache で eviction を避ける pin を付ける用　Cache Hit 以外の in-flight requests を数える
 // SIEVE Cache, Waiter Count, cache file を操作する場合は Lock が必要
 
+func (c *CacheServer) handleHeadRequest(w http.ResponseWriter, r *http.Request) {
+
+	reference := &url.URL{
+		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
+		RawQuery: r.URL.RawQuery,
+	}
+
+	target := c.origin.ResolveReference(reference)
+	req, err := http.NewRequest(http.MethodHead, target.String(), nil)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("X-NCDN-PoPCache-NodeId", c.nodeId)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+}
+
+func (c *CacheServer) handleRangeRequest(w http.ResponseWriter, r *http.Request) {
+
+	reference := &url.URL{
+		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
+		RawQuery: r.URL.RawQuery,
+	}
+
+	target := c.origin.ResolveReference(reference)
+	req, err := http.NewRequest(http.MethodGet, target.String(), nil)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("X-NCDN-PoPCache-NodeId", c.nodeId)
+	req.Header.Set("Range", r.Header.Get("Range"))
+	resp, err := c.client.Do(req)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
 func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+	if r.Method == http.MethodHead {
+		slog.Info("Head request")
+		c.handleHeadRequest(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Header.Get("Range") != "" {
+		slog.Info("range request")
+		c.handleRangeRequest(w, r)
 		return
 	}
 
