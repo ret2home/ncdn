@@ -16,13 +16,13 @@ import (
 )
 
 type WaiterEntry struct {
-	cacheKey         string
-	ch               chan struct{}
-	resultEntry      *CacheEntry
-	waiter           int
-	isTmpFile        bool
-	isErrorStale     bool
-	staledStatusCode int
+	cacheKey             string
+	ch                   chan struct{}
+	resultEntry          *CacheEntry
+	waiter               int
+	isTmpFile            bool
+	isErrorStale         bool
+	errorStaleStatusCode int
 }
 type LoadingCounter struct {
 	counter      int
@@ -95,22 +95,22 @@ func (c *CacheServer) finishLoading(waiter_entry *WaiterEntry) {
 	}
 }
 
+func newErrorEntry(status int) *CacheEntry {
+	return &CacheEntry{
+		statusCode: status,
+		header:     make(http.Header),
+		path:       "",
+		size:       0,
+		saveTime:   time.Now(),
+		cc:         nil,
+	}
+}
 func (c *CacheServer) internalNewRequest(
 	waiter_entry *WaiterEntry,
 	cacheKey string,
 	noStore bool,
 	targetURL *url.URL,
 ) {
-	newErrorEntry := func(status int) *CacheEntry {
-		return &CacheEntry{
-			statusCode: status,
-			header:     make(http.Header),
-			path:       "",
-			size:       0,
-			saveTime:   time.Now(),
-			cc:         nil,
-		}
-	}
 
 	req, err := http.NewRequest(http.MethodGet, targetURL.String(), nil)
 	if err != nil {
@@ -153,7 +153,7 @@ func (c *CacheServer) internalNewRequest(
 		if staleFlag {
 			waiter_entry.resultEntry = cacheent
 			waiter_entry.isErrorStale = true
-			waiter_entry.staledStatusCode = returnStatusCode
+			waiter_entry.errorStaleStatusCode = returnStatusCode
 		} else {
 			waiter_entry.resultEntry = newErrorEntry(returnStatusCode)
 		}
@@ -319,8 +319,6 @@ type LoadTypeInfo struct {
 	staleWhileRevalidate bool
 	inFlightLoading      bool
 	cacheEntry           *CacheEntry
-	cacheFile            *os.File
-	cacheFileError       error
 }
 
 func (c *CacheServer) DecideTypeOfLoad(cacheKey string, cc *RequestCacheControl) LoadTypeInfo {
@@ -345,13 +343,6 @@ func (c *CacheServer) DecideTypeOfLoad(cacheKey string, cc *RequestCacheControl)
 		}
 	}
 
-	var (
-		file      *os.File
-		openError error
-	)
-	if !wantLoad {
-		file, openError = os.Open(cacheent.path)
-	}
 	return LoadTypeInfo{
 		waiterEntry:          waiter_entry,
 		wantNewLoad:          wantLoad && !loading_flag,
@@ -360,8 +351,6 @@ func (c *CacheServer) DecideTypeOfLoad(cacheKey string, cc *RequestCacheControl)
 		returnCache:          !wantLoad,
 		inFlightLoading:      loading_flag,
 		cacheEntry:           cacheent,
-		cacheFile:            file,
-		cacheFileError:       openError,
 	}
 }
 
@@ -448,13 +437,13 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if loadInfo.wantNewLoad {
 		xCacheMessage = "MISS"
 		waiterEntry = &WaiterEntry{
-			cacheKey:         cacheKeyFromURI,
-			ch:               make(chan struct{}),
-			resultEntry:      nil,
-			waiter:           1,
-			isTmpFile:        false,
-			isErrorStale:     false,
-			staledStatusCode: 0,
+			cacheKey:             cacheKeyFromURI,
+			ch:                   make(chan struct{}),
+			resultEntry:          nil,
+			waiter:               1,
+			isTmpFile:            false,
+			isErrorStale:         false,
+			errorStaleStatusCode: 0,
 		}
 
 		c.AddWaiterCount(cacheKeyFromURI) // for first waiter
@@ -464,26 +453,34 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		go c.internalNewRequest(waiterEntry, cacheKeyFromURI, cc.NoStore, c.createTargetURL(r.URL))
 
 	} else if loadInfo.returnCache {
-		if loadInfo.cacheFileError != nil {
-			c.mu.Unlock()
-			w.WriteHeader(http.StatusInternalServerError)
-			return
+		xCacheMessage = "HIT"
+
+		// pseudo-waiter
+		waiterEntry = &WaiterEntry{
+			cacheKey:             cacheKeyFromURI,
+			ch:                   make(chan struct{}),
+			resultEntry:          nil,
+			waiter:               1,
+			isTmpFile:            false,
+			isErrorStale:         false,
+			errorStaleStatusCode: 0,
 		}
+		c.AddWaiterCount(cacheKeyFromURI)
 
 		if !loadInfo.staleWhileRevalidate {
 			c.mu.Unlock()
-			internalServeCache(loadInfo.cacheEntry, loadInfo.cacheFile, w, "HIT")
+			waiterEntry.resultEntry = loadInfo.cacheEntry
 		} else {
 			xCacheMessage = "STALE-REVALIDATE"
 			if !loadInfo.inFlightLoading {
 				backgroundWaiterEntry := &WaiterEntry{
-					cacheKey:         cacheKeyFromURI,
-					ch:               make(chan struct{}),
-					resultEntry:      nil,
-					waiter:           0,
-					isTmpFile:        false,
-					isErrorStale:     false,
-					staledStatusCode: 0,
+					cacheKey:             cacheKeyFromURI,
+					ch:                   make(chan struct{}),
+					resultEntry:          nil,
+					waiter:               0,
+					isTmpFile:            false,
+					isErrorStale:         false,
+					errorStaleStatusCode: 0,
 				}
 
 				c.latestWaiterEntries[cacheKeyFromURI] = backgroundWaiterEntry
@@ -494,9 +491,9 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				c.mu.Unlock()
 				xCacheMessage = "STALE-REVALIDATE-COLLAPSED"
 			}
-			internalServeCache(loadInfo.cacheEntry, loadInfo.cacheFile, w, xCacheMessage)
+			waiterEntry.resultEntry = loadInfo.cacheEntry
 		}
-		return
+		close(waiterEntry.ch)
 	} else if loadInfo.collapsed {
 		xCacheMessage = "COLLAPSED"
 		waiterEntry = loadInfo.waiterEntry
@@ -519,15 +516,17 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			file.Close()
 		}
-		http.Error(w, http.StatusText(waiterEntry.staledStatusCode), waiterEntry.staledStatusCode)
+		http.Error(w, http.StatusText(waiterEntry.errorStaleStatusCode), waiterEntry.errorStaleStatusCode)
 	} else {
 		if waiterEntry.isErrorStale {
 			xCacheMessage = xCacheMessage + "-ERROR-STALE" // MISS-ERROR-STALE, COLLAPSED-ERROR-STALE
 		}
 		if err == nil {
 			internalServeCache(waiterEntry.resultEntry, file, w, xCacheMessage)
-		} else {
+		} else if waiterEntry.resultEntry.path == "" {
 			internalServeData(waiterEntry.resultEntry, w, xCacheMessage)
+		} else {
+			http.Error(w, "Cache file unavailable", http.StatusInternalServerError)
 		}
 	}
 
