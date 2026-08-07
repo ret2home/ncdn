@@ -125,7 +125,7 @@ func (c *CacheServer) internalNewRequest(
 		waiter_entry.bodyReadFinish = true
 		waiter_entry.cond.Broadcast()
 		waiter_entry.mu.Unlock()
-		c.mu.Unlock()
+		c.mu.Lock()
 		c.finishLoading(waiter_entry)
 		c.mu.Unlock()
 
