@@ -22,7 +22,7 @@
 void* memcpy(void*, const void*, unsigned long);
 int memcmp(const void*, const void*, unsigned long);
 
-#define DEBUG_LB_MAIN 1
+#define DEBUG_LB_MAIN 0
 
 // clang-format off
 struct stat_counters { /* go:Add,String */

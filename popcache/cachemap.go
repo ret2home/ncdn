@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -74,6 +75,7 @@ func (c *SieveCache) evictOne() bool {
 		}
 		c.list.MoveHand()
 	}
+	slog.Info("Eviction failed...")
 	return false
 }
 func (c *SieveCache) evictAndInsertInternal(key string, ent *CacheEntry) bool {
