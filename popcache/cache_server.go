@@ -536,9 +536,6 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 	xCacheMessages := make([]string, len(chunks))
 	cacheKeyFromURIAndChunkIDs := make([]string, len(chunks))
 
-	files := make([]*os.File, len(chunks))
-	fileError := make([]error, len(chunks))
-
 	for key, values := range headWaiterEntry.resultEntry.header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -551,12 +548,19 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 	w.Header().Set("X-Cache", xTotalCacheMessage)
 	w.WriteHeader(http.StatusPartialContent)
 
-	for i, chunk := range chunks {
-		cacheKeyFromURIAndChunkIDs[i] = "GET" + "\x00" + r.Host + "\x00" + r.URL.RequestURI() + "\x00" + strconv.Itoa(chunk.start)
-		chunkSpecStr := "bytes=" + strconv.Itoa(chunks[i].start) + "-" + strconv.Itoa(chunks[i].end)
-		waiterEntries[i], xCacheMessages[i] = c.createWaiter(cacheKeyFromURIAndChunkIDs[i], &cc, c.createTargetURL(r.URL), "GET", chunkSpecStr)
+	issue := func(idx int) {
+		cacheKeyFromURIAndChunkIDs[idx] = "GET" + "\x00" + r.Host + "\x00" + r.URL.RequestURI() + "\x00" + strconv.Itoa(chunks[idx].start)
+		chunkSpecStr := "bytes=" + strconv.Itoa(chunks[idx].start) + "-" + strconv.Itoa(chunks[idx].end)
+		waiterEntries[idx], xCacheMessages[idx] = c.createWaiter(cacheKeyFromURIAndChunkIDs[idx], &cc, c.createTargetURL(r.URL), "GET", chunkSpecStr)
+	}
 
-		slog.Info(fmt.Sprintf("%s , %s", cacheKeyFromURIAndChunkIDs[i], xCacheMessages[i]))
+	const WINDOWSIZE = 10
+
+	nextIssue := 0
+	for ; nextIssue < min(WINDOWSIZE, len(chunks)); nextIssue++ {
+		issue(nextIssue)
+	}
+	for i := range chunks {
 		<-waiterEntries[i].ch
 
 		c.mu.Lock()
@@ -564,24 +568,29 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 		c.SubWaiterCount(cacheKeyFromURIAndChunkIDs[i])
 		removeFile := waiterEntries[i].waiter == 0 && waiterEntries[i].isTmpFile
 
-		files[i], fileError[i] = os.Open(waiterEntries[i].resultEntry.path)
+		file, fileError := os.Open(waiterEntries[i].resultEntry.path)
 
-		if fileError[i] == nil {
-			defer files[i].Close()
+		finishHelper := func() {
+			if file != nil {
+				file.Close()
+			}
+			if removeFile {
+				os.Remove(waiterEntries[i].resultEntry.path)
+			}
 		}
-		if removeFile {
-			defer os.Remove(waiterEntries[i].resultEntry.path)
-		}
+
 		c.mu.Unlock()
 
 		if waiterEntries[i].isErrorStale && cc.NoCache {
+			finishHelper()
 			return
 		} else {
 			if waiterEntries[i].isErrorStale {
 				xCacheMessages[i] = xCacheMessages[i] + "-ERROR-STALE" // MISS-ERROR-STALE, COLLAPSED-ERROR-STALE
 			}
 
-			if fileError[i] != nil || waiterEntries[i].resultEntry.statusCode != http.StatusPartialContent {
+			if fileError != nil || waiterEntries[i].resultEntry.statusCode != http.StatusPartialContent {
+				finishHelper()
 				return
 			}
 		}
@@ -589,9 +598,17 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 
 		realStart := max(chunks[i].start, byteRange.start)
 		realEnd := min(chunks[i].end, byteRange.end)
-		section := io.NewSectionReader(files[i], int64(realStart-chunks[i].start), (int64(realEnd - realStart + 1)))
+		section := io.NewSectionReader(file, int64(realStart-chunks[i].start), (int64(realEnd - realStart + 1)))
+
 		if _, err := io.Copy(w, section); err != nil {
+			finishHelper()
 			return
+		}
+		finishHelper()
+
+		if nextIssue < len(chunks) {
+			issue(nextIssue)
+			nextIssue++
 		}
 	}
 }
