@@ -397,9 +397,9 @@ func (c *CacheServer) DecideTypeOfLoad(cacheKey string, cc *RequestCacheControl)
 }
 
 // Request ごとに Waiter Entry を作成し，Request Collapse する場合は entry の channel で待たせる
-// Waiter Entry ごと，URI ごとに counter がある
-// Waiter Entry Counter: Cache に保存しない Collapse 側通知用の一時ファイルの寿命管理　待ち collapsed requests を数える
-// URI Counter: SIEVE Cache で eviction を避ける pin を付ける用　Cache Hit 以外の in-flight requests を数える
+// Waiter Entry ごと，cache Entry ごとに counter がある
+// Waiter Entry Counter: Cache に保存しない Collapse 側通知用の一時ファイルの寿命管理　Waiter で待っているリクエストごとにカウント
+// Cache Entry Counter: Cache に保存したファイルの寿命管理　CacheEntry を見ている Waiter ごとにカウント，Waiter Counter が 0 になったら下げる
 // SIEVE Cache, Waiter Count, cache file を操作する場合は Lock が必要
 
 func newWaiterEntry(cacheKey string, waiter int) *WaiterEntry {
