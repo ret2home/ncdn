@@ -9,7 +9,6 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/yzp0n/ncdn/httprps"
 )
@@ -89,7 +88,7 @@ func serveJson(w http.ResponseWriter, r *http.Request) {
 }
 func withCacheControl(next http.Handler, value string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		slog.Info("req header: %v\n", r.Header)
+		slog.Info(fmt.Sprintf("req header: %v\n", r.Header))
 		w.Header().Set("Cache-Control", value)
 		w.Header().Set("X-NCDN-PoPCache-NodeId", r.Header.Get("X-NCDN-PoPCache-NodeId"))
 		next.ServeHTTP(w, r)
@@ -110,7 +109,7 @@ func main() {
 		w.Header().Set("Cache-Control", "max-age=5, stale-while-revalidate=15, stale-if-error=60")
 		w.Header().Set("X-NCDN-PoPCache-NodeId", r.Header.Get("X-NCDN-PoPCache-NodeId"))
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Hello %s\nDate: %s\n", num, time.Now().String())
+		fmt.Fprintf(w, "Hello %s\n", num)
 	})
 	mux.HandleFunc("/index.html", serveIndexHTML)
 	mux.HandleFunc("/json", serveJson)
