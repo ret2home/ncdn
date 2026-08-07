@@ -101,12 +101,6 @@ func (c *CacheServer) internalNewRequest(
 	noStore bool,
 	targetURL *url.URL,
 ) {
-	defer func() {
-		c.mu.Lock()
-		c.SubWaiterCount(cacheKey)
-		c.mu.Unlock()
-	}()
-
 	newErrorEntry := func(status int) *CacheEntry {
 		return &CacheEntry{
 			statusCode: status,
@@ -228,7 +222,7 @@ func (c *CacheServer) internalNewRequest(
 		if cacheable {
 			if renameErr := os.Rename(tmpPath, path); renameErr == nil {
 				if c.sievecache.Set(cacheKey, result) { // shoule be always ok
-					c.sievecache.SetPin(cacheKey, c.waiterCount[cacheKey] > 1) // without own
+					c.sievecache.SetPin(cacheKey, c.waiterCount[cacheKey] > 0)
 					committed = true
 				}
 			}
@@ -335,16 +329,16 @@ func (c *CacheServer) DecideTypeOfLoad(cacheKey string, cc *RequestCacheControl)
 
 	wantLoad := false
 	background := false
-	if !cachehit || cacheent.cc.NoCache || cc.NoCache || cacheent.cc.MaxAge == -1 { // Cache Miss, No-Cache from req/resp, no cache maxage
+	if !cachehit || cacheent.cc.NoCache || cc.NoCache || cacheent.cc.MaxAge == -1 { // Cache Miss, req/resp-no-cache, no resp-maxage
 		wantLoad = true
 	} else if cc.MaxAge != -1 && cacheent.saveTime.Before(time.Now().Add(-time.Second*time.Duration(cc.MaxAge))) { // expired by req-maxage
 		wantLoad = true
 	} else if cacheent.saveTime.Add(time.Second * time.Duration(cacheent.cc.MaxAge)).Before(time.Now()) { // expired by resp-maxage
 		fresh := cacheent.saveTime.Add(time.Second * time.Duration(cacheent.cc.MaxAge))
-		if cacheent.cc.MustRevalidate { // must-revalidate
+		if cacheent.cc.MustRevalidate { // resp-must-revalidate
 			wantLoad = true
 		} else if cacheent.cc.StaleWhileRevalidate != -1 &&
-			fresh.Add(time.Second*time.Duration(cacheent.cc.StaleWhileRevalidate)).After(time.Now()) { // stale-while-revalidate
+			fresh.Add(time.Second*time.Duration(cacheent.cc.StaleWhileRevalidate)).After(time.Now()) { // resp-stale-while-revalidate
 			background = true
 		} else {
 			wantLoad = true
@@ -463,7 +457,6 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			staledStatusCode: 0,
 		}
 
-		c.AddWaiterCount(cacheKeyFromURI) // for fetcher
 		c.AddWaiterCount(cacheKeyFromURI) // for first waiter
 		c.latestWaiterEntries[cacheKeyFromURI] = waiterEntry
 		c.mu.Unlock()
@@ -493,7 +486,6 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					staledStatusCode: 0,
 				}
 
-				c.AddWaiterCount(cacheKeyFromURI)
 				c.latestWaiterEntries[cacheKeyFromURI] = backgroundWaiterEntry
 				c.mu.Unlock()
 				go c.internalNewRequest(backgroundWaiterEntry, cacheKeyFromURI, cc.NoStore, c.createTargetURL(r.URL))
@@ -524,7 +516,7 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.mu.Unlock()
 
 	if waiterEntry.isErrorStale && cc.NoCache {
-		if err != nil {
+		if err == nil {
 			file.Close()
 		}
 		http.Error(w, http.StatusText(waiterEntry.staledStatusCode), waiterEntry.staledStatusCode)
