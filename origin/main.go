@@ -9,6 +9,7 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/yzp0n/ncdn/httprps"
 )
@@ -46,6 +47,7 @@ func serveIndexHTMLInternal(w http.ResponseWriter, r *http.Request) error {
 	w.Header().Set("Content-Type", "text/html")
 	w.Header().Set("X-NCDN-PoPCache-NodeId", r.Header.Get("X-NCDN-PoPCache-NodeId"))
 	w.Header().Set("Cache-Control", "max-age=60, stale-while-revalidate=120, stale-if-error=180")
+	w.Header().Set("Content-Length", strconv.Itoa(len(buf.Bytes())))
 	_, err = w.Write(buf.Bytes())
 	if err != nil {
 		log.Printf("Failed to write response: %v", err)
@@ -99,7 +101,7 @@ func main() {
 
 	fs := withCacheControl(
 		http.FileServer(http.Dir("./static")),
-		"public, max-age=3600",
+		"public, max-age=3600, stale-while-revalidate=15, stale-if-error=60",
 	)
 
 	mux := http.NewServeMux()
