@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -44,6 +45,7 @@ func serveIndexHTMLInternal(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("X-NCDN-PoPCache-NodeId", r.Header.Get("X-NCDN-PoPCache-NodeId"))
 	w.Header().Set("Cache-Control", "max-age=60, stale-while-revalidate=120, stale-if-error=180")
 	_, err = w.Write(buf.Bytes())
 	if err != nil {
@@ -87,7 +89,9 @@ func serveJson(w http.ResponseWriter, r *http.Request) {
 }
 func withCacheControl(next http.Handler, value string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("req header: %v\n", r.Header)
 		w.Header().Set("Cache-Control", value)
+		w.Header().Set("X-NCDN-PoPCache-NodeId", r.Header.Get("X-NCDN-PoPCache-NodeId"))
 		next.ServeHTTP(w, r)
 	})
 }
@@ -104,6 +108,7 @@ func main() {
 		num := r.PathValue("num")
 		w.Header().Set("Content-Type", "text/html")
 		w.Header().Set("Cache-Control", "max-age=5, stale-while-revalidate=15, stale-if-error=60")
+		w.Header().Set("X-NCDN-PoPCache-NodeId", r.Header.Get("X-NCDN-PoPCache-NodeId"))
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Hello %s\nDate: %s\n", num, time.Now().String())
 	})
