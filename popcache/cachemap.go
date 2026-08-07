@@ -13,11 +13,12 @@ type CacheEntry struct {
 	path       string
 	size       int64
 	saveTime   time.Time
+	retired    bool
+	counter    int
 	cc         *ResponseCacheControl
 }
 type cacheattr struct {
 	accessed bool
-	pin      bool
 }
 
 type SieveCache struct {
@@ -51,13 +52,15 @@ func (c *SieveCache) insertInternal(key string, ent *CacheEntry) {
 	c.cache[key] = ent
 	c.attr[key] = &cacheattr{
 		accessed: false,
-		pin:      false,
 	}
 	c.list.InsertFront(key)
 	c.size++
 }
 func (c *SieveCache) evict(e *ListEntry) {
-	os.Remove(c.cache[e.val].path)
+	c.cache[e.val].retired = true
+	if c.cache[e.val].counter == 0 {
+		os.Remove(c.cache[e.val].path)
+	}
 	delete(c.cache, e.val)
 	delete(c.attr, e.val)
 	c.size--
@@ -66,16 +69,14 @@ func (c *SieveCache) evict(e *ListEntry) {
 func (c *SieveCache) evictOne() bool {
 	for i := 0; i < int(c.size)*2; i++ {
 		key := c.list.hand.val
-		if !c.attr[key].accessed && !c.attr[key].pin {
+		if !c.attr[key].accessed {
 			c.evict(c.list.hand)
 			return true
 		}
-		if !c.attr[key].pin {
-			c.attr[key].accessed = false
-		}
+		c.attr[key].accessed = false
 		c.list.MoveHand()
 	}
-	slog.Info("Eviction failed...")
+	slog.Info("Eviction failed...") // NOT REACH!!
 	return false
 }
 func (c *SieveCache) evictAndInsertInternal(key string, ent *CacheEntry) bool {
@@ -91,8 +92,12 @@ func (c *SieveCache) evictAndInsertInternal(key string, ent *CacheEntry) bool {
 	}
 }
 func (c *SieveCache) Set(key string, ent *CacheEntry) bool {
-	_, ok := c.cache[key]
+	prev, ok := c.cache[key]
 	if ok {
+		prev.retired = true
+		if prev.counter == 0 {
+			os.Remove(prev.path)
+		}
 		c.cache[key] = ent
 		return true
 	} else {
@@ -105,12 +110,5 @@ func (c *SieveCache) MakeRoom(key string) bool {
 		return true
 	} else {
 		return c.evictOne()
-	}
-}
-
-func (c *SieveCache) SetPin(key string, pin bool) {
-	v, ok := c.attr[key]
-	if ok {
-		v.pin = pin
 	}
 }
