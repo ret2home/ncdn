@@ -118,7 +118,6 @@ func (c *CacheServer) internalNewRequest(
 
 	req, err := http.NewRequest(httpMethod, targetURL.String(), nil)
 	if err != nil {
-		c.mu.Lock()
 		substituteHeaderEtc(waiter_entry, http.StatusInternalServerError, make(http.Header), "")
 		close(waiter_entry.headerDone)
 		waiter_entry.mu.Lock()
@@ -126,6 +125,7 @@ func (c *CacheServer) internalNewRequest(
 		waiter_entry.bodyReadFinish = true
 		waiter_entry.cond.Broadcast()
 		waiter_entry.mu.Unlock()
+		c.mu.Unlock()
 		c.finishLoading(waiter_entry)
 		c.mu.Unlock()
 
@@ -208,7 +208,6 @@ func (c *CacheServer) internalNewRequest(
 	if err == nil {
 		cachePath = tmpfile.Name()
 	} else {
-		c.mu.Lock()
 		substituteHeaderEtc(waiter_entry, http.StatusInternalServerError, make(http.Header), "")
 		close(waiter_entry.headerDone)
 		waiter_entry.mu.Lock()
@@ -216,6 +215,7 @@ func (c *CacheServer) internalNewRequest(
 		waiter_entry.bodyReadFinish = true
 		waiter_entry.cond.Broadcast()
 		waiter_entry.mu.Unlock()
+		c.mu.Lock()
 		c.finishLoading(waiter_entry)
 		c.mu.Unlock()
 		return
@@ -482,9 +482,7 @@ func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, tar
 		xCacheMessage = "COLLAPSED"
 		waiterEntry = loadInfo.waiterEntry
 
-		waiterEntry.mu.Lock()
 		waiterEntry.waiter++
-		waiterEntry.mu.Unlock()
 		c.AddWaiterCount(cacheKey)
 		c.mu.Unlock()
 	}
@@ -577,7 +575,7 @@ func (c *CacheServer) handleNonRangeRequest(w http.ResponseWriter, r *http.Reque
 
 	<-waiterEntry.headerDone
 
-	c.mu.Lock()
+	c.mu.Lock() // FIXME: potential race
 	file, err := os.Open(waiterEntry.path)
 	c.mu.Unlock()
 
@@ -610,11 +608,9 @@ func (c *CacheServer) handleNonRangeRequest(w http.ResponseWriter, r *http.Reque
 	<-waiterEntry.complete
 
 	c.mu.Lock()
-	waiterEntry.mu.Lock()
 	waiterEntry.waiter--
 	c.SubWaiterCount(cacheKeyFromURI)
 	removeFile := waiterEntry.waiter == 0 && waiterEntry.isTmpFile
-	waiterEntry.mu.Unlock()
 	c.mu.Unlock()
 	if removeFile {
 		os.Remove(waiterEntry.path)
@@ -632,9 +628,7 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 	<-headWaiterEntry.complete
 
 	c.mu.Lock()
-	headWaiterEntry.mu.Lock()
 	headWaiterEntry.waiter--
-	headWaiterEntry.mu.Unlock()
 	c.SubWaiterCount(cacheKeyFromURIAndHead)
 	removeFile := headWaiterEntry.waiter == 0 && headWaiterEntry.isTmpFile
 	c.mu.Unlock()
