@@ -411,6 +411,85 @@ func (c *CacheServer) handleRangeRequest(w http.ResponseWriter, r *http.Request)
 	io.Copy(w, resp.Body)
 }
 
+func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, targetURL *url.URL) (*WaiterEntry, string) {
+
+	var waiterEntry *WaiterEntry
+	var xCacheMessage string
+
+	c.mu.Lock()
+	loadInfo := c.DecideTypeOfLoad(cacheKey, cc)
+
+	if loadInfo.wantNewLoad {
+		xCacheMessage = "MISS"
+		waiterEntry = &WaiterEntry{
+			cacheKey:             cacheKey,
+			ch:                   make(chan struct{}),
+			resultEntry:          nil,
+			waiter:               1,
+			isTmpFile:            false,
+			isErrorStale:         false,
+			errorStaleStatusCode: 0,
+		}
+
+		c.AddWaiterCount(cacheKey) // for first waiter
+		c.latestWaiterEntries[cacheKey] = waiterEntry
+		c.mu.Unlock()
+
+		go c.internalNewRequest(waiterEntry, cacheKey, cc.NoStore, targetURL)
+
+	} else if loadInfo.returnCache {
+		xCacheMessage = "HIT"
+
+		// pseudo-waiter
+		waiterEntry = &WaiterEntry{
+			cacheKey:             cacheKey,
+			ch:                   make(chan struct{}),
+			resultEntry:          nil,
+			waiter:               1,
+			isTmpFile:            false,
+			isErrorStale:         false,
+			errorStaleStatusCode: 0,
+		}
+		c.AddWaiterCount(cacheKey)
+
+		if !loadInfo.staleWhileRevalidate {
+			c.mu.Unlock()
+			waiterEntry.resultEntry = loadInfo.cacheEntry
+		} else {
+			xCacheMessage = "STALE-REVALIDATE"
+			if !loadInfo.inFlightLoading {
+				backgroundWaiterEntry := &WaiterEntry{
+					cacheKey:             cacheKey,
+					ch:                   make(chan struct{}),
+					resultEntry:          nil,
+					waiter:               0,
+					isTmpFile:            false,
+					isErrorStale:         false,
+					errorStaleStatusCode: 0,
+				}
+
+				c.latestWaiterEntries[cacheKey] = backgroundWaiterEntry
+				c.mu.Unlock()
+				go c.internalNewRequest(backgroundWaiterEntry, cacheKey, cc.NoStore, targetURL)
+
+			} else {
+				c.mu.Unlock()
+				xCacheMessage = "STALE-REVALIDATE-COLLAPSED"
+			}
+			waiterEntry.resultEntry = loadInfo.cacheEntry
+		}
+		close(waiterEntry.ch)
+	} else if loadInfo.collapsed {
+		xCacheMessage = "COLLAPSED"
+		waiterEntry = loadInfo.waiterEntry
+
+		waiterEntry.waiter++
+		c.AddWaiterCount(cacheKey)
+		c.mu.Unlock()
+	}
+	return waiterEntry, xCacheMessage
+}
+
 func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodHead {
 		c.handleHeadRequest(w, r)
@@ -428,80 +507,8 @@ func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cc := ParseRequestCacheControl(r.Header.Values("Cache-Control"))
 
 	cacheKeyFromURI := r.Host + "\x00" + r.URL.RequestURI()
-	c.mu.Lock()
-	loadInfo := c.DecideTypeOfLoad(cacheKeyFromURI, &cc)
 
-	var waiterEntry *WaiterEntry
-	var xCacheMessage string
-
-	if loadInfo.wantNewLoad {
-		xCacheMessage = "MISS"
-		waiterEntry = &WaiterEntry{
-			cacheKey:             cacheKeyFromURI,
-			ch:                   make(chan struct{}),
-			resultEntry:          nil,
-			waiter:               1,
-			isTmpFile:            false,
-			isErrorStale:         false,
-			errorStaleStatusCode: 0,
-		}
-
-		c.AddWaiterCount(cacheKeyFromURI) // for first waiter
-		c.latestWaiterEntries[cacheKeyFromURI] = waiterEntry
-		c.mu.Unlock()
-
-		go c.internalNewRequest(waiterEntry, cacheKeyFromURI, cc.NoStore, c.createTargetURL(r.URL))
-
-	} else if loadInfo.returnCache {
-		xCacheMessage = "HIT"
-
-		// pseudo-waiter
-		waiterEntry = &WaiterEntry{
-			cacheKey:             cacheKeyFromURI,
-			ch:                   make(chan struct{}),
-			resultEntry:          nil,
-			waiter:               1,
-			isTmpFile:            false,
-			isErrorStale:         false,
-			errorStaleStatusCode: 0,
-		}
-		c.AddWaiterCount(cacheKeyFromURI)
-
-		if !loadInfo.staleWhileRevalidate {
-			c.mu.Unlock()
-			waiterEntry.resultEntry = loadInfo.cacheEntry
-		} else {
-			xCacheMessage = "STALE-REVALIDATE"
-			if !loadInfo.inFlightLoading {
-				backgroundWaiterEntry := &WaiterEntry{
-					cacheKey:             cacheKeyFromURI,
-					ch:                   make(chan struct{}),
-					resultEntry:          nil,
-					waiter:               0,
-					isTmpFile:            false,
-					isErrorStale:         false,
-					errorStaleStatusCode: 0,
-				}
-
-				c.latestWaiterEntries[cacheKeyFromURI] = backgroundWaiterEntry
-				c.mu.Unlock()
-				go c.internalNewRequest(backgroundWaiterEntry, cacheKeyFromURI, cc.NoStore, c.createTargetURL(r.URL))
-
-			} else {
-				c.mu.Unlock()
-				xCacheMessage = "STALE-REVALIDATE-COLLAPSED"
-			}
-			waiterEntry.resultEntry = loadInfo.cacheEntry
-		}
-		close(waiterEntry.ch)
-	} else if loadInfo.collapsed {
-		xCacheMessage = "COLLAPSED"
-		waiterEntry = loadInfo.waiterEntry
-
-		waiterEntry.waiter++
-		c.AddWaiterCount(cacheKeyFromURI)
-		c.mu.Unlock()
-	}
+	waiterEntry, xCacheMessage := c.createWaiter(cacheKeyFromURI, &cc, c.createTargetURL(r.URL))
 
 	<-waiterEntry.ch
 
