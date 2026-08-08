@@ -493,6 +493,10 @@ func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, tar
 func copyFlightRange(w http.ResponseWriter, file *os.File, we *WaiterEntry, start int64, end int64) error {
 	pos := start
 
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return err
+	}
+
 	for pos < end {
 		we.mu.Lock()
 
@@ -509,17 +513,14 @@ func copyFlightRange(w http.ResponseWriter, file *os.File, we *WaiterEntry, star
 		readEnd := min(produced, end)
 
 		if pos < readEnd {
-			section := io.NewSectionReader(
-				file,
-				pos,
-				readEnd-pos,
-			)
+			n := readEnd - pos
 
-			if _, err := io.Copy(w, section); err != nil {
+			written, err := io.CopyN(w, file, n)
+			pos += written
+
+			if err != nil {
 				return err
 			}
-
-			pos = readEnd
 		}
 
 		if pos >= end {
@@ -553,12 +554,14 @@ func copyFlightToEOF(w http.ResponseWriter, file *os.File, we *WaiterEntry) erro
 		we.mu.Unlock()
 
 		if pos < produced {
-			section := io.NewSectionReader(file, pos, produced-pos)
+			n := produced - pos
 
-			if _, err := io.Copy(w, section); err != nil {
+			written, err := io.CopyN(w, file, n)
+			pos += written
+
+			if err != nil {
 				return err
 			}
-			pos = produced
 		}
 
 		if finished {
