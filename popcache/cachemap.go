@@ -1,9 +1,9 @@
 package main
 
 import (
-	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -27,6 +27,7 @@ type SieveCache struct {
 	list            *LinkList
 	size            uint32
 	maxCacheEntries uint32
+	mu              sync.Mutex
 }
 
 func NewSieveCache(maxEntries uint32) *SieveCache {
@@ -38,7 +39,7 @@ func NewSieveCache(maxEntries uint32) *SieveCache {
 		maxCacheEntries: maxEntries,
 	}
 }
-func (c *SieveCache) Get(key string) (*CacheEntry, bool) {
+func (c *SieveCache) internalGet(key string) (*CacheEntry, bool) {
 	v, ok := c.cache[key]
 	if ok {
 		c.attr[key].accessed = true
@@ -66,32 +67,28 @@ func (c *SieveCache) evict(e *ListEntry) {
 	c.size--
 	c.list.Remove(e)
 }
-func (c *SieveCache) evictOne() bool {
+func (c *SieveCache) evictOne() {
 	for i := 0; i < int(c.size)*2; i++ {
 		key := c.list.hand.val
 		if !c.attr[key].accessed {
 			c.evict(c.list.hand)
-			return true
+			return
 		}
 		c.attr[key].accessed = false
 		c.list.MoveHand()
 	}
-	slog.Info("Eviction failed...") // NOT REACH!!
-	return false
 }
-func (c *SieveCache) evictAndInsertInternal(key string, ent *CacheEntry) bool {
+func (c *SieveCache) evictAndInsertInternal(key string, ent *CacheEntry) {
 	if c.size < c.maxCacheEntries {
 		c.insertInternal(key, ent)
-		return true
 	} else {
-		if c.evictOne() {
-			c.insertInternal(key, ent)
-			return true
-		}
-		return false
+		c.evictOne()
+		c.insertInternal(key, ent)
 	}
 }
-func (c *SieveCache) Set(key string, ent *CacheEntry) bool {
+func (c *SieveCache) Set(key string, ent *CacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	prev, ok := c.cache[key]
 	if ok {
 		prev.retired = true
@@ -99,16 +96,27 @@ func (c *SieveCache) Set(key string, ent *CacheEntry) bool {
 			os.Remove(prev.path)
 		}
 		c.cache[key] = ent
-		return true
 	} else {
-		return c.evictAndInsertInternal(key, ent)
+		c.evictAndInsertInternal(key, ent)
 	}
 }
-func (c *SieveCache) MakeRoom(key string) bool {
-	_, ok := c.cache[key]
-	if ok || c.size < c.maxCacheEntries {
-		return true
-	} else {
-		return c.evictOne()
+func (c *SieveCache) Acquire(key string) (*CacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.internalGet(key)
+	if ok {
+		v.counter++
+	}
+	return v, ok
+}
+
+func (c *SieveCache) Release(entry *CacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry != nil {
+		entry.counter--
+		if entry.retired && entry.counter == 0 {
+			os.Remove(entry.path)
+		}
 	}
 }

@@ -42,7 +42,7 @@ type CacheServer struct {
 	latestWaiterEntries map[string]*WaiterEntry
 	client              *http.Client
 	nodeId              string
-	mu                  sync.Mutex
+	mu                  sync.Mutex // latestWaiterEntries 用
 	maxFileSize         int64
 }
 
@@ -113,18 +113,16 @@ func (c *CacheServer) internalNewRequest(
 	httpMethod string,
 	rangeSpec string,
 ) {
-	slog.Info(fmt.Sprintf("New Request! %s", cacheKey))
-
 	req, err := http.NewRequest(httpMethod, targetURL.String(), nil)
 	if err != nil {
+		c.mu.Lock()
+		waiter_entry.mu.Lock()
 		substituteHeaderEtc(waiter_entry, http.StatusInternalServerError, make(http.Header), "")
 		close(waiter_entry.headerDone)
-		waiter_entry.mu.Lock()
 		waiter_entry.bodyReadError = err
 		waiter_entry.bodyReadFinish = true
 		waiter_entry.cond.Broadcast()
 		waiter_entry.mu.Unlock()
-		c.mu.Lock()
 		c.finishLoading(waiter_entry)
 		c.mu.Unlock()
 
@@ -145,9 +143,7 @@ func (c *CacheServer) internalNewRequest(
 		if err == nil {
 			defer resp.Body.Close()
 		}
-		c.mu.Lock()
-
-		cacheent, cachehit := c.sievecache.Get(cacheKey)
+		cacheent, cachehit := c.sievecache.Acquire(cacheKey)
 
 		staleFlag := false
 		// for each requests, must check req.cc.Nocache!
@@ -169,23 +165,28 @@ func (c *CacheServer) internalNewRequest(
 			waiter_entry.bodyReadFinish = true
 			waiter_entry.cond.Broadcast()
 			waiter_entry.cacheEntry = cacheent
-			cacheent.counter++
-			waiter_entry.mu.Unlock()
 			substituteHeaderEtc(waiter_entry, cacheent.statusCode, cacheent.header, cacheent.path)
 			waiter_entry.isErrorStale = true
 			waiter_entry.errorStaleStatusCode = returnStatusCode
+			waiter_entry.mu.Unlock()
 		} else {
+			if cachehit {
+				c.sievecache.Release(cacheent)
+			}
+			waiter_entry.mu.Lock()
 			waiter_entry.statusCode = returnStatusCode
 			substituteHeaderEtc(waiter_entry, returnStatusCode, make(http.Header), "")
+			waiter_entry.mu.Unlock()
 		}
 		close(waiter_entry.headerDone)
 
+		c.mu.Lock()
 		waiter_entry.mu.Lock()
 		waiter_entry.bodyReadFinish = true
 		waiter_entry.cond.Broadcast()
 		waiter_entry.mu.Unlock()
-		c.finishLoading(waiter_entry)
 
+		c.finishLoading(waiter_entry)
 		c.mu.Unlock()
 
 		slog.Error(fmt.Sprintf("Origin Error %s %v\n", cacheKey, err))
@@ -209,14 +210,14 @@ func (c *CacheServer) internalNewRequest(
 	if err == nil {
 		cachePath = tmpfile.Name()
 	} else {
+		c.mu.Lock()
+		waiter_entry.mu.Lock()
 		substituteHeaderEtc(waiter_entry, http.StatusInternalServerError, make(http.Header), "")
 		close(waiter_entry.headerDone)
-		waiter_entry.mu.Lock()
 		waiter_entry.bodyReadError = err
 		waiter_entry.bodyReadFinish = true
 		waiter_entry.cond.Broadcast()
 		waiter_entry.mu.Unlock()
-		c.mu.Lock()
 		c.finishLoading(waiter_entry)
 		c.mu.Unlock()
 		return
@@ -280,48 +281,6 @@ func (c *CacheServer) internalNewRequest(
 		removePath string
 	)
 
-	c.mu.Lock()
-
-	if copyErr == nil && closeOK && cachePath != "" {
-
-		// 事前に eviction しておく
-
-		cacheable := (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) && !resp_cc.NoStore && !noStore && resp_cc.MaxAge != -1 &&
-			totalWritten < c.maxFileSize && c.sievecache.MakeRoom(cacheKey)
-
-		if cacheable {
-			result := &CacheEntry{
-				statusCode: resp.StatusCode,
-				header:     resp.Header.Clone(),
-				path:       cachePath,
-				size:       totalWritten,
-				saveTime:   time.Now(),
-				cc:         &resp_cc,
-				retired:    false,
-				counter:    0,
-			}
-			if c.sievecache.Set(cacheKey, result) { // shoule be always ok
-				committed = true
-				if waiter_entry.waiter > 0 {
-					waiter_entry.cacheEntry = result
-					result.counter++
-				}
-			}
-		}
-
-		if !committed {
-			waiter_entry.isTmpFile = true
-			if waiter_entry.waiter == 0 {
-				removePath = cachePath
-			}
-		}
-	} else {
-		waiter_entry.isTmpFile = true
-		if waiter_entry.waiter == 0 {
-			removePath = cachePath
-		}
-	}
-
 	switch {
 	case copyErr != nil:
 		{
@@ -334,7 +293,57 @@ func (c *CacheServer) internalNewRequest(
 		}
 	}
 
+	c.mu.Lock()
+
+	if copyErr == nil && closeOK && cachePath != "" {
+
+		// 事前に eviction しておく
+
+		cacheable := (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) && !resp_cc.NoStore && !noStore && resp_cc.MaxAge != -1 &&
+			totalWritten < c.maxFileSize
+
+		if cacheable {
+			result := &CacheEntry{
+				statusCode: resp.StatusCode,
+				header:     resp.Header.Clone(),
+				path:       cachePath,
+				size:       totalWritten,
+				saveTime:   time.Now(),
+				cc:         &resp_cc,
+				retired:    false,
+				counter:    0,
+			}
+
+			waiter_entry.mu.Lock()
+			if waiter_entry.waiter > 0 {
+				waiter_entry.cacheEntry = result
+				result.counter++
+			}
+			waiter_entry.mu.Unlock()
+
+			c.sievecache.Set(cacheKey, result)
+			committed = true
+		}
+
+		if !committed {
+			waiter_entry.mu.Lock()
+			waiter_entry.isTmpFile = true
+			if waiter_entry.waiter == 0 {
+				removePath = cachePath
+			}
+			waiter_entry.mu.Unlock()
+		}
+	} else {
+		waiter_entry.mu.Lock()
+		waiter_entry.isTmpFile = true
+		if waiter_entry.waiter == 0 {
+			removePath = cachePath
+		}
+		waiter_entry.mu.Unlock()
+	}
+
 	c.finishLoading(waiter_entry)
+
 	c.mu.Unlock()
 
 	if removePath != "" {
@@ -364,7 +373,7 @@ type LoadTypeInfo struct {
 }
 
 func (c *CacheServer) DecideTypeOfLoad(cacheKey string, cc *RequestCacheControl) LoadTypeInfo {
-	cacheent, cachehit := c.sievecache.Get(cacheKey)
+	cacheent, cachehit := c.sievecache.Acquire(cacheKey)
 	waiter_entry, loading_flag := c.latestWaiterEntries[cacheKey]
 
 	wantLoad := false
@@ -422,6 +431,8 @@ func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, tar
 	c.mu.Lock()
 	loadInfo := c.DecideTypeOfLoad(cacheKey, cc)
 
+	useCacheFlag := false
+
 	if loadInfo.wantNewLoad {
 		xCacheMessage = "MISS"
 		waiterEntry = newWaiterEntry(cacheKey, 1)
@@ -437,7 +448,6 @@ func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, tar
 		waiterEntry = newWaiterEntry(cacheKey, 1)
 		// pseudo-waiter
 
-		loadInfo.cacheEntry.counter++
 		if !loadInfo.staleWhileRevalidate {
 			c.mu.Unlock()
 		} else {
@@ -462,12 +472,19 @@ func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, tar
 		waiterEntry.bodyReadError = nil
 		close(waiterEntry.headerDone)
 		close(waiterEntry.complete)
+		useCacheFlag = true
 	} else if loadInfo.collapsed {
 		xCacheMessage = "COLLAPSED"
 		waiterEntry = loadInfo.waiterEntry
 
+		waiterEntry.mu.Lock()
 		waiterEntry.waiter++
+		waiterEntry.mu.Unlock()
+
 		c.mu.Unlock()
+	}
+	if !useCacheFlag && loadInfo.cacheEntry != nil {
+		c.sievecache.Release(loadInfo.cacheEntry)
 	}
 	return waiterEntry, xCacheMessage
 }
@@ -588,19 +605,16 @@ func (c *CacheServer) handleNonRangeRequest(w http.ResponseWriter, r *http.Reque
 
 	<-waiterEntry.complete
 
-	c.mu.Lock()
+	waiterEntry.mu.Lock()
 	waiterEntry.waiter--
-	if waiterEntry.waiter == 0 && waiterEntry.cacheEntry != nil {
-		waiterEntry.cacheEntry.counter--
-	}
+	releaseFlag := waiterEntry.waiter == 0 && waiterEntry.cacheEntry != nil
 	removeTmpFile := waiterEntry.waiter == 0 && waiterEntry.isTmpFile
-	removeOldCacheFile := waiterEntry.cacheEntry != nil && waiterEntry.cacheEntry.retired && waiterEntry.cacheEntry.counter == 0
-	c.mu.Unlock()
+	waiterEntry.mu.Unlock()
 	if removeTmpFile {
 		os.Remove(waiterEntry.path)
 	}
-	if removeOldCacheFile {
-		os.Remove(waiterEntry.cacheEntry.path)
+	if releaseFlag {
+		c.sievecache.Release(waiterEntry.cacheEntry)
 	}
 }
 
@@ -614,21 +628,18 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 
 	<-headWaiterEntry.complete
 
-	c.mu.Lock()
+	headWaiterEntry.mu.Lock()
 	headWaiterEntry.waiter--
-	if headWaiterEntry.waiter == 0 && headWaiterEntry.cacheEntry != nil {
-		headWaiterEntry.cacheEntry.counter--
-	}
+	releaseFlag := headWaiterEntry.waiter == 0 && headWaiterEntry.cacheEntry != nil
 	removeTmpFile := headWaiterEntry.waiter == 0 && headWaiterEntry.isTmpFile
-	removeOldCacheFile := headWaiterEntry.cacheEntry != nil && headWaiterEntry.cacheEntry.retired && headWaiterEntry.cacheEntry.counter == 0
 
-	c.mu.Unlock()
+	headWaiterEntry.mu.Unlock()
 
 	if removeTmpFile {
 		os.Remove(headWaiterEntry.path) // not required but...
 	}
-	if removeOldCacheFile {
-		os.Remove(headWaiterEntry.cacheEntry.path)
+	if releaseFlag {
+		c.sievecache.Release(headWaiterEntry.cacheEntry)
 	}
 
 	if headWaiterEntry.isErrorStale && cc.NoCache {
@@ -690,13 +701,11 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 
 		<-waiterEntries[i].complete
 
-		c.mu.Lock()
+		waiterEntries[i].mu.Lock()
 		waiterEntries[i].waiter--
-		if waiterEntries[i].waiter == 0 && waiterEntries[i].cacheEntry != nil {
-			waiterEntries[i].cacheEntry.counter--
-		}
+		releaseFlag := waiterEntries[i].waiter == 0 && waiterEntries[i].cacheEntry != nil
 		removeTmpFile := waiterEntries[i].waiter == 0 && waiterEntries[i].isTmpFile
-		removeOldCacheFile := waiterEntries[i].cacheEntry != nil && waiterEntries[i].cacheEntry.retired && waiterEntries[i].cacheEntry.counter == 0
+		waiterEntries[i].mu.Unlock()
 
 		if file != nil {
 			file.Close()
@@ -704,11 +713,9 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 		if removeTmpFile {
 			os.Remove(waiterEntries[i].path)
 		}
-		if removeOldCacheFile {
-			os.Remove(waiterEntries[i].cacheEntry.path)
+		if releaseFlag {
+			c.sievecache.Release(waiterEntries[i].cacheEntry)
 		}
-
-		c.mu.Unlock()
 	}
 
 	nextIssue := 0
@@ -734,7 +741,7 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 				xCacheMessages[i] = xCacheMessages[i] + "-ERROR-STALE" // MISS-ERROR-STALE, COLLAPSED-ERROR-STALE
 			}
 
-			if fileError != nil || waiterEntries[i].statusCode != http.StatusPartialContent {
+			if fileError != nil || (waiterEntries[i].statusCode != http.StatusPartialContent && waiterEntries[i].statusCode != http.StatusOK) {
 				cleaner(i, file)
 				return
 			}
@@ -785,6 +792,12 @@ func (c *CacheServer) handleMultiRangeRequest(w http.ResponseWriter, r *http.Req
 }
 func (c *CacheServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		if r.Method == http.MethodPost {
+			n, err := io.Copy(io.Discard, r.Body)
+			slog.Info("upload", "bytes", n, "err", err)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
