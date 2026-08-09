@@ -31,6 +31,7 @@ type WaiterEntry struct {
 	isErrorStale         bool
 	errorStaleStatusCode int
 	cacheEntry           *CacheEntry // for counter
+	analysisRequest      AnalysisTraceRef
 }
 type LoadingCounter struct {
 	counter      int
@@ -44,7 +45,10 @@ type CacheServer struct {
 	nodeId              string
 	mu                  sync.Mutex // latestWaiterEntries 用
 	maxFileSize         int64
+	analysis            *AnalysisState
 }
+
+const copyFlightProgressChunkSize = 1 << 20
 
 func (c *CacheServer) createTargetURL(u *url.URL) *url.URL {
 	reference := &url.URL{
@@ -89,8 +93,18 @@ func NewCacheServer(origin *url.URL, nodeId string) *CacheServer {
 		},
 		nodeId:      nodeId,
 		maxFileSize: 16 * (1 << 20), // 16MB
+		analysis:    NewAnalysisState(),
 	}
 	return &cs
+}
+
+func (c *CacheServer) beginAnalysisRequest(r *http.Request, requestId uint64, cacheKey string, start, end int64) AnalysisTraceRef {
+	if c.analysis == nil || !c.analysis.IsEnabled() {
+		return AnalysisTraceRef{}
+	}
+
+	requestCacheControl := strings.Join(r.Header.Values("Cache-Control"), ",")
+	return c.analysis.BeginRequest(requestId, cacheKey, start, end, requestCacheControl)
 }
 
 func (c *CacheServer) finishLoading(waiter_entry *WaiterEntry) {
@@ -113,6 +127,11 @@ func (c *CacheServer) internalNewRequest(
 	httpMethod string,
 	rangeSpec string,
 ) {
+	analysisOrigin := AnalysisTraceRef{}
+	if c.analysis != nil && waiter_entry.analysisRequest.trace != nil {
+		analysisOrigin = c.analysis.StartOrigin(waiter_entry.analysisRequest)
+	}
+
 	req, err := http.NewRequest(httpMethod, targetURL.String(), nil)
 	if err != nil {
 		c.mu.Lock()
@@ -137,6 +156,9 @@ func (c *CacheServer) internalNewRequest(
 	}
 
 	resp, err := c.client.Do(req)
+	if c.analysis != nil && analysisOrigin.trace != nil && resp != nil {
+		c.analysis.SetHeader(analysisOrigin, resp.StatusCode, resp.Header)
+	}
 
 	// STALE IF ERROR
 	if err != nil || resp.StatusCode == 500 || resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 504 {
@@ -253,6 +275,9 @@ func (c *CacheServer) internalNewRequest(
 			if copyErr != nil {
 				break
 			}
+			if c.analysis != nil && analysisOrigin.trace != nil {
+				c.analysis.AddBytes(analysisOrigin, int64(written))
+			}
 			waiter_entry.mu.Lock()
 			waiter_entry.produced += int64(rn)
 			waiter_entry.cond.Broadcast()
@@ -268,6 +293,9 @@ func (c *CacheServer) internalNewRequest(
 	closeOK := false
 	if tmpfile != nil {
 		closeOK = tmpfile.Close() == nil
+	}
+	if c.analysis != nil && analysisOrigin.trace != nil {
+		c.analysis.Finish(analysisOrigin)
 	}
 
 	waiter_entry.mu.Lock()
@@ -423,10 +451,12 @@ func newWaiterEntry(cacheKey string, waiter int) *WaiterEntry {
 	w.cond = sync.NewCond(&w.mu)
 	return w
 }
-func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, targetURL *url.URL, httpMethod string, rangeSpec string) (*WaiterEntry, string) {
+func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, targetURL *url.URL, httpMethod string, rangeSpec string, analysisRequest AnalysisTraceRef) (*WaiterEntry, string, string, AnalysisTraceRef) {
 
 	var waiterEntry *WaiterEntry
 	var xCacheMessage string
+	var analysisResult string
+	var producerRequest AnalysisTraceRef
 
 	c.mu.Lock()
 	loadInfo := c.DecideTypeOfLoad(cacheKey, cc)
@@ -435,7 +465,10 @@ func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, tar
 
 	if loadInfo.wantNewLoad {
 		xCacheMessage = "MISS"
+		analysisResult = AnalysisResultMiss
+		producerRequest = analysisRequest
 		waiterEntry = newWaiterEntry(cacheKey, 1)
+		waiterEntry.analysisRequest = analysisRequest
 
 		c.latestWaiterEntries[cacheKey] = waiterEntry
 		c.mu.Unlock()
@@ -444,6 +477,7 @@ func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, tar
 
 	} else if loadInfo.returnCache {
 		xCacheMessage = "HIT"
+		analysisResult = AnalysisResultHit
 
 		waiterEntry = newWaiterEntry(cacheKey, 1)
 		// pseudo-waiter
@@ -452,15 +486,19 @@ func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, tar
 			c.mu.Unlock()
 		} else {
 			xCacheMessage = "STALE-REVALIDATE"
+			analysisResult = AnalysisResultSWR
 			if !loadInfo.inFlightLoading {
 
 				backgroundWaiterEntry := newWaiterEntry(cacheKey, 0)
+				producerRequest = analysisRequest
+				backgroundWaiterEntry.analysisRequest = analysisRequest
 
 				c.latestWaiterEntries[cacheKey] = backgroundWaiterEntry
 				c.mu.Unlock()
 				go c.internalNewRequest(backgroundWaiterEntry, cacheKey, cc.NoStore, targetURL, httpMethod, rangeSpec)
 
 			} else {
+				producerRequest = loadInfo.waiterEntry.analysisRequest
 				c.mu.Unlock()
 				xCacheMessage = "STALE-REVALIDATE-COLLAPSED"
 			}
@@ -475,7 +513,9 @@ func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, tar
 		useCacheFlag = true
 	} else if loadInfo.collapsed {
 		xCacheMessage = "COLLAPSED"
+		analysisResult = AnalysisResultCollapsed
 		waiterEntry = loadInfo.waiterEntry
+		producerRequest = waiterEntry.analysisRequest
 
 		waiterEntry.mu.Lock()
 		waiterEntry.waiter++
@@ -486,11 +526,14 @@ func (c *CacheServer) createWaiter(cacheKey string, cc *RequestCacheControl, tar
 	if !useCacheFlag && loadInfo.cacheEntry != nil {
 		c.sievecache.Release(loadInfo.cacheEntry)
 	}
-	return waiterEntry, xCacheMessage
+	if c.analysis != nil {
+		c.analysis.SetRequestResult(analysisRequest, analysisResult, producerRequest)
+	}
+	return waiterEntry, xCacheMessage, analysisResult, producerRequest
 }
 
 // [start,end)
-func copyFlightRange(w http.ResponseWriter, file *os.File, we *WaiterEntry, start int64, end int64) error {
+func copyFlightRange(w http.ResponseWriter, file *os.File, we *WaiterEntry, start int64, end int64, onWrite func(int64)) error {
 	pos := start
 
 	if _, err := file.Seek(start, io.SeekStart); err != nil {
@@ -515,7 +558,13 @@ func copyFlightRange(w http.ResponseWriter, file *os.File, we *WaiterEntry, star
 		if pos < readEnd {
 			n := readEnd - pos
 
-			written, err := io.CopyN(w, file, n)
+			// Previous one-shot copy, kept for easy rollback:
+			// written, err := io.CopyN(w, file, n)
+			// pos += written
+			// if onWrite != nil {
+			// 	onWrite(written)
+			// }
+			written, err := copyNWithProgress(w, file, n, onWrite)
 			pos += written
 
 			if err != nil {
@@ -537,7 +586,7 @@ func copyFlightRange(w http.ResponseWriter, file *os.File, we *WaiterEntry, star
 
 	return nil
 }
-func copyFlightToEOF(w http.ResponseWriter, file *os.File, we *WaiterEntry) error {
+func copyFlightToEOF(w http.ResponseWriter, file *os.File, we *WaiterEntry, onWrite func(int64)) error {
 	var pos int64
 
 	for {
@@ -556,7 +605,13 @@ func copyFlightToEOF(w http.ResponseWriter, file *os.File, we *WaiterEntry) erro
 		if pos < produced {
 			n := produced - pos
 
-			written, err := io.CopyN(w, file, n)
+			// Previous one-shot copy, kept for easy rollback:
+			// written, err := io.CopyN(w, file, n)
+			// pos += written
+			// if onWrite != nil {
+			// 	onWrite(written)
+			// }
+			written, err := copyNWithProgress(w, file, n, onWrite)
 			pos += written
 
 			if err != nil {
@@ -569,14 +624,36 @@ func copyFlightToEOF(w http.ResponseWriter, file *os.File, we *WaiterEntry) erro
 		}
 	}
 }
+
+func copyNWithProgress(w io.Writer, r io.Reader, n int64, onWrite func(int64)) (int64, error) {
+	var totalWritten int64
+	for totalWritten < n {
+		step := min(n-totalWritten, copyFlightProgressChunkSize)
+		written, err := io.CopyN(w, r, step)
+		totalWritten += written
+		if written > 0 && onWrite != nil {
+			onWrite(written)
+		}
+		if err != nil {
+			return totalWritten, err
+		}
+	}
+	return totalWritten, nil
+}
+
 func (c *CacheServer) handleNonRangeRequest(w http.ResponseWriter, r *http.Request) {
 	cc := ParseRequestCacheControl(r.Header.Values("Cache-Control"))
 
 	cacheKeyFromURI := r.Method + "\x00" + r.Host + "\x00" + r.URL.RequestURI()
 
-	waiterEntry, xCacheMessage := c.createWaiter(cacheKeyFromURI, &cc, c.createTargetURL(r.URL), r.Method, "")
+	analysisReq := c.beginAnalysisRequest(r, 0, cacheKeyFromURI, 0, -1)
+
+	waiterEntry, xCacheMessage, _, _ := c.createWaiter(cacheKeyFromURI, &cc, c.createTargetURL(r.URL), r.Method, "", analysisReq)
 
 	<-waiterEntry.headerDone
+	if c.analysis != nil {
+		c.analysis.SetHeader(analysisReq, waiterEntry.statusCode, waiterEntry.header)
+	}
 
 	file, err := os.Open(waiterEntry.path)
 
@@ -589,6 +666,9 @@ func (c *CacheServer) handleNonRangeRequest(w http.ResponseWriter, r *http.Reque
 	} else {
 		if waiterEntry.isErrorStale {
 			xCacheMessage = xCacheMessage + "-ERROR-STALE" // MISS-ERROR-STALE, COLLAPSED-ERROR-STALE
+			if c.analysis != nil {
+				c.analysis.UpdateRequestResult(analysisReq, AnalysisResultSIE)
+			}
 		}
 		if err == nil {
 			for key, values := range waiterEntry.header {
@@ -598,7 +678,11 @@ func (c *CacheServer) handleNonRangeRequest(w http.ResponseWriter, r *http.Reque
 			}
 			w.Header().Set("X-Cache", xCacheMessage)
 			w.WriteHeader(waiterEntry.statusCode)
-			copyFlightToEOF(w, file, waiterEntry)
+			if copyFlightToEOF(w, file, waiterEntry, func(n int64) {
+				c.analysis.AddBytes(analysisReq, n)
+			}) == nil {
+				c.analysis.Finish(analysisReq)
+			}
 		} else if waiterEntry.path == "" {
 			internalServeOnlyStatusCode(waiterEntry.header, waiterEntry.statusCode, w, xCacheMessage)
 		} else {
@@ -619,17 +703,23 @@ func (c *CacheServer) handleNonRangeRequest(w http.ResponseWriter, r *http.Reque
 	if releaseFlag {
 		c.sievecache.Release(waiterEntry.cacheEntry)
 	}
+	c.analysis.Finish(analysisReq)
 }
 
 func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Request) {
 	cc := ParseRequestCacheControl(r.Header.Values("Cache-Control"))
 
 	cacheKeyFromURIAndHead := "HEAD" + "\x00" + r.Host + "\x00" + r.URL.RequestURI()
+	analysisHeadReq := c.beginAnalysisRequest(r, 0, cacheKeyFromURIAndHead, 0, -1)
 
 	var xTotalCacheMessage string
-	headWaiterEntry, xHeadCacheMessage := c.createWaiter(cacheKeyFromURIAndHead, &cc, c.createTargetURL(r.URL), "HEAD", "")
+	headWaiterEntry, xHeadCacheMessage, _, _ := c.createWaiter(cacheKeyFromURIAndHead, &cc, c.createTargetURL(r.URL), "HEAD", "", analysisHeadReq)
 
 	<-headWaiterEntry.complete
+	if c.analysis != nil {
+		c.analysis.SetHeader(analysisHeadReq, headWaiterEntry.statusCode, headWaiterEntry.header)
+		c.analysis.Finish(analysisHeadReq)
+	}
 
 	headWaiterEntry.mu.Lock()
 	headWaiterEntry.waiter--
@@ -673,6 +763,11 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 	waiterEntries := make([]*WaiterEntry, len(chunks))
 	xCacheMessages := make([]string, len(chunks))
 	cacheKeyFromURIAndChunkIDs := make([]string, len(chunks))
+	analysisRequests := make([]AnalysisTraceRef, len(chunks))
+	var analysisRequestId uint64
+	if analysisHeadReq.trace != nil {
+		analysisRequestId = analysisHeadReq.trace.RequestId
+	}
 
 	for key, values := range headWaiterEntry.header {
 		for _, value := range values {
@@ -689,12 +784,34 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 	issue := func(idx int) {
 		cacheKeyFromURIAndChunkIDs[idx] = "GET" + "\x00" + r.Host + "\x00" + r.URL.RequestURI() + "\x00" + strconv.Itoa(chunks[idx].start)
 		chunkSpecStr := "bytes=" + strconv.Itoa(chunks[idx].start) + "-" + strconv.Itoa(chunks[idx].end)
-		waiterEntries[idx], xCacheMessages[idx] = c.createWaiter(cacheKeyFromURIAndChunkIDs[idx], &cc, c.createTargetURL(r.URL), "GET", chunkSpecStr)
+		analysisRequests[idx] = c.beginAnalysisRequest(
+			r,
+			analysisRequestId,
+			cacheKeyFromURIAndChunkIDs[idx],
+			int64(chunks[idx].start),
+			int64(chunks[idx].end),
+		)
+		if idx == 0 {
+			analysisRequestId = 0
+			if analysisRequests[idx].trace != nil {
+				analysisRequestId = analysisRequests[idx].trace.RequestId
+			}
+		}
+		waiterEntries[idx], xCacheMessages[idx], _, _ = c.createWaiter(cacheKeyFromURIAndChunkIDs[idx], &cc, c.createTargetURL(r.URL), "GET", chunkSpecStr, analysisRequests[idx])
 	}
 
 	const WINDOWSIZE = 10
 
 	cleanedUp := make([]bool, len(chunks))
+	analysisFinished := make([]bool, len(chunks))
+
+	finishAnalysisRequest := func(i int) {
+		if analysisFinished[i] {
+			return
+		}
+		analysisFinished[i] = true
+		c.analysis.Finish(analysisRequests[i])
+	}
 
 	cleaner := func(i int, file *os.File) {
 		if cleanedUp[i] {
@@ -729,23 +846,32 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 	defer func() {
 		for i := 0; i < nextIssue; i++ {
 			cleaner(i, nil)
+			finishAnalysisRequest(i)
 		}
 	}()
 	for i := range chunks {
 		<-waiterEntries[i].headerDone
+		if c.analysis != nil {
+			c.analysis.SetHeader(analysisRequests[i], waiterEntries[i].statusCode, waiterEntries[i].header)
+		}
 
 		file, fileError := os.Open(waiterEntries[i].path)
 
 		if waiterEntries[i].isErrorStale && cc.NoCache {
 			cleaner(i, file)
+			finishAnalysisRequest(i)
 			return
 		} else {
 			if waiterEntries[i].isErrorStale {
 				xCacheMessages[i] = xCacheMessages[i] + "-ERROR-STALE" // MISS-ERROR-STALE, COLLAPSED-ERROR-STALE
+				if c.analysis != nil {
+					c.analysis.UpdateRequestResult(analysisRequests[i], AnalysisResultSIE)
+				}
 			}
 
 			if fileError != nil || (waiterEntries[i].statusCode != http.StatusPartialContent && waiterEntries[i].statusCode != http.StatusOK) {
 				cleaner(i, file)
+				finishAnalysisRequest(i)
 				return
 			}
 		}
@@ -756,10 +882,14 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 		localStart := int64(realStart - chunks[i].start)
 		localEnd := int64(realEnd - chunks[i].start)
 
-		if err := copyFlightRange(w, file, waiterEntries[i], int64(localStart), int64(localEnd)); err != nil {
+		if err := copyFlightRange(w, file, waiterEntries[i], int64(localStart), int64(localEnd), func(n int64) {
+			c.analysis.AddBytes(analysisRequests[i], n)
+		}); err != nil {
 			cleaner(i, file)
+			finishAnalysisRequest(i)
 			return
 		}
+		finishAnalysisRequest(i)
 		cleaner(i, file)
 
 		if nextIssue < len(chunks) {
@@ -769,7 +899,6 @@ func (c *CacheServer) handleSingleRangeRequest(w http.ResponseWriter, r *http.Re
 	}
 }
 func (c *CacheServer) handleMultiRangeRequest(w http.ResponseWriter, r *http.Request) {
-
 	target := c.createTargetURL(r.URL)
 	req, err := http.NewRequest(http.MethodGet, target.String(), nil)
 	if err != nil {

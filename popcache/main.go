@@ -54,6 +54,9 @@ func main() {
 	})
 
 	cs := NewCacheServer(originURL, *nodeId)
+	mux.HandleFunc("/debug/analysis/start", cs.handleAnalysisStart)
+	mux.HandleFunc("/debug/analysis/stop", cs.handleAnalysisStop)
+	mux.HandleFunc("/debug/analysis", cs.handleAnalysisSnapshot)
 	mux.Handle("/", cs)
 	/*mux.Handle("/", &httputil.ReverseProxy{
 		// FIXME: actually cache stuff...

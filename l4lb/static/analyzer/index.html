@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NCDN Analysis</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand"><span class="brand-mark">◇</span>NCDN Analysis</div>
+        <div class="session" id="sessionTime">Captured: -</div>
+        <div class="recording" id="statusPill">LOADING</div>
+        <button class="danger" id="stopButton">Stop Analysis</button>
+        <button id="startButton">Start Analysis</button>
+        <label class="limit">Keep IDs <input id="maxRequestIds" type="number" min="0" value="10000"></label>
+        <button id="exportButton">Export JSON</button>
+        <button id="importButton">Import JSON</button>
+        <input id="importFile" type="file" accept="application/json" hidden>
+        <label class="toggle">Auto Refresh <input id="autoRefresh" type="checkbox" checked></label>
+        <label class="limit">Interval <input id="refreshIntervalMs" type="number" min="100" step="100" value="1000"> ms</label>
+        <button id="refreshButton">Refresh</button>
+      </header>
+
+      <aside class="sidebar">
+        <section>
+          <h2>TARGET</h2>
+          <div id="popButtons"></div>
+        </section>
+        <section>
+          <h2>URI FILTER</h2>
+          <input class="filter" id="uriFilter" placeholder="Filter by URI...">
+        </section>
+        <section>
+          <h2>SORT BY</h2>
+          <select class="select" id="sortBy">
+            <option value="requests">Requests (desc)</option>
+            <option value="origin">Origin Fetch (desc)</option>
+            <option value="bytes">Client Data (desc)</option>
+            <option value="hit">Hit Ratio (desc)</option>
+          </select>
+        </section>
+        <section class="session-box">
+          <h2>Session Info</h2>
+          <dl id="sessionInfo"></dl>
+        </section>
+      </aside>
+
+      <main class="content">
+        <section class="metrics" id="metrics"></section>
+        <section class="panel uri-panel">
+          <div class="tabs">
+            <button class="tab active" data-overview="uri">URI Overview</button>
+            <button class="tab" data-overview="pop">PoP Overview</button>
+          </div>
+          <div class="overview-table">
+            <div id="overviewHead"></div>
+            <div id="overviewRows"></div>
+          </div>
+        </section>
+        <section class="panel timeline-panel">
+          <div class="timeline-head">
+            <div class="section-title" id="timelineTitle">CHUNK POSITION VIEW</div>
+            <label class="time-scale-control" id="positionScaleControl">
+              <span>Scale</span>
+              <input id="positionScaleSlider" type="range" min="0" max="10" step="1" value="8">
+              <strong id="positionScaleValue">16MiB / grid</strong>
+            </label>
+          </div>
+          <div id="timelineBody">
+            <h3>ORIGIN FETCH</h3>
+            <div class="chart" id="originChart"></div>
+            <h3>CLIENT REQUESTS</h3>
+            <div class="chart" id="requestChart"></div>
+          </div>
+          <div class="linked-time-view hidden" id="linkedTimePanel">
+            <div class="linked-time-head">
+              <div class="section-title" id="linkedTimeTitle">TIME VIEW</div>
+              <label class="time-scale-control" id="timeScaleControl">
+                <span>Scale</span>
+                <input id="timeScaleSlider" type="range" min="0" max="16" step="1" value="11">
+                <strong id="timeScaleValue">1.00s / grid</strong>
+              </label>
+            </div>
+            <div id="linkedTimeBody"></div>
+          </div>
+          <div class="legend">
+            <span class="hit">HIT</span><span class="miss">MISS</span><span class="collapsed">COLLAPSED</span>
+            <span class="swr">SWR</span><span class="sie">SIE</span><span class="header-wait">HEADER_WAIT</span><span class="fetch">FETCH</span>
+          </div>
+        </section>
+      </main>
+
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>
