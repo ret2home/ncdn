@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/yzp0n/ncdn/httprps"
 )
@@ -88,10 +89,14 @@ func serveJson(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
-func withCacheControl(next http.Handler, value string) http.Handler {
+func withCacheControl(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		slog.Info(fmt.Sprintf("req header: %v\n", r.Header))
-		w.Header().Set("Cache-Control", value)
+		if strings.HasSuffix(r.URL.Path, ".m3u8") {
+			w.Header().Set("Cache-Control", "no-cache")
+		} else {
+			w.Header().Set("Cache-Control", "public, max-age=3600, stale-while-revalidate=15, stale-if-error=60")
+		}
 		w.Header().Set("X-NCDN-PoPCache-NodeId", r.Header.Get("X-NCDN-PoPCache-NodeId"))
 		next.ServeHTTP(w, r)
 	})
@@ -99,10 +104,7 @@ func withCacheControl(next http.Handler, value string) http.Handler {
 func main() {
 	flag.Parse()
 
-	fs := withCacheControl(
-		http.FileServer(http.Dir("./static")),
-		"public, max-age=3600, stale-while-revalidate=15, stale-if-error=60",
-	)
+	fs := withCacheControl(http.FileServer(http.Dir("./static")))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/number/{num}", func(w http.ResponseWriter, r *http.Request) {
@@ -122,7 +124,13 @@ func main() {
 			return
 		}
 
-		fs.ServeHTTP(w, r)
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			fs.ServeHTTP(w, r)
+		default:
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		}
+
 	})
 
 	rps := httprps.NewMiddleware(mux)
