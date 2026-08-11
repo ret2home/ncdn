@@ -204,6 +204,11 @@ button:hover {
   padding: 0 8px;
 }
 
+.compact-select {
+  width: 96px;
+  height: 30px;
+}
+
 .session-box {
   margin-top: 18px;
   padding-top: 8px;
@@ -633,7 +638,6 @@ h3 {
   padding-bottom: 4px;
 }
 
-.time-client-pinned,
 .time-view,
 .time-throughput-view,
 .position-view {
@@ -650,9 +654,52 @@ h3 {
   background: #101820;
 }
 
+.time-client-pinned.trace-section {
+  grid-template-columns: none;
+}
+
 .position-view-stack {
   display: grid;
   gap: 10px;
+}
+
+.time-view-stack {
+  display: grid;
+  gap: 2px;
+}
+
+.time-h-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  overflow-anchor: none;
+  padding-bottom: 4px;
+}
+
+.time-wide {
+  width: calc(var(--time-width) + 112px);
+}
+
+.time-wide .trace-section-head,
+.time-wide .trace-section-body,
+.time-wide.time-throughput-view,
+.time-wide .time-throughput-view {
+  grid-template-columns: 104px var(--time-width);
+}
+
+.position-h-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  overflow-anchor: none;
+  padding-bottom: 4px;
+}
+
+.position-wide {
+  width: calc(var(--position-width) + 112px);
+}
+
+.position-wide .trace-section-head,
+.position-wide .trace-section-body {
+  grid-template-columns: 104px var(--position-width);
 }
 
 .trace-section {
@@ -699,6 +746,43 @@ h3 {
   overflow: auto;
 }
 
+.position-axis-pane {
+  overflow: hidden;
+  padding-bottom: 0;
+}
+
+.time-axis-pane {
+  overflow: hidden;
+  padding-bottom: 0;
+}
+
+.position-chart-pane {
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.time-chart-pane {
+  overflow-x: hidden;
+}
+
+.time-origin-section .time-chart-pane {
+  overflow-y: auto;
+}
+
+.canvas-scroll-spacer {
+  position: relative;
+  min-height: 31px;
+}
+
+.trace-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  display: block;
+  pointer-events: none;
+}
+
 .time-throughput-view {
   margin-top: 10px;
   padding-top: 2px;
@@ -710,6 +794,18 @@ h3 {
   position: relative;
   z-index: 2;
   background: #101820;
+}
+
+.position-h-scroll .position-labels {
+  position: sticky;
+  left: 0;
+  z-index: 5;
+}
+
+.time-h-scroll .time-labels {
+  position: sticky;
+  left: 0;
+  z-index: 10;
 }
 
 .time-labels h3,
@@ -895,13 +991,7 @@ h3 {
   left: 0;
   z-index: 1;
   width: var(--track-width);
-  background: repeating-linear-gradient(
-    90deg,
-    transparent 0,
-    transparent calc(var(--grid-width) - 1px),
-    #1d2d37 calc(var(--grid-width) - 1px),
-    #1d2d37 var(--grid-width)
-  );
+  background: transparent;
   pointer-events: none;
 }
 
@@ -929,13 +1019,7 @@ h3 {
   height: 20px;
   overflow: visible;
   border: 0;
-  background: repeating-linear-gradient(
-    90deg,
-    transparent 0,
-    transparent calc(var(--grid-width) - 1px),
-    #1d2d37 calc(var(--grid-width) - 1px),
-    #1d2d37 var(--grid-width)
-  );
+  background: transparent;
 }
 
 .time-axis b,

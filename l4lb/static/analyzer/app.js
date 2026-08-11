@@ -14,6 +14,9 @@ const timeScaleValuesMs = [60000, 30000, 15000, 10000, 5000, 1000, 500, 100, 50,
 const throughputChartHeightPx = 150;
 const positionGridWidthPx = 120;
 const positionScaleValuesBytes = [64 * 1048576, 32 * 1048576, 16 * 1048576, 8 * 1048576, 4 * 1048576, 1048576, 512 * 1024, 256 * 1024, 128 * 1024, 64 * 1024, 16 * 1024];
+const traceLabelColumnPx = 112;
+const traceRowHeightPx = 31;
+const traceBarHeightPx = 22;
 
 const state = {
   aggregate: demoAggregate(),
@@ -27,12 +30,15 @@ const state = {
   timeScrollLeft: 0,
   timeRestoreAnchorMs: null,
   timeZoomAnchorMs: null,
+  timeZoomAnchorOffsetPx: null,
   timeZoomAnchorRatio: 0.5,
+  timeViewMode: "simple",
   positionScaleBytes: 16 * 1048576,
   positionScaleIndex: 2,
   positionScrollLeft: 0,
   positionRestoreAnchorBytes: null,
   positionZoomAnchorBytes: null,
+  positionZoomAnchorOffsetPx: null,
   positionZoomAnchorRatio: 0.5,
   traceYScroll: {},
   filter: "",
@@ -43,11 +49,18 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
-let syncingTimeScroll = false;
-let syncingPositionScroll = false;
 let syncingTraceYScroll = false;
 let refreshTimer = null;
+let deferredRenderTimer = null;
+let chartScrollIdleTimer = null;
+let renderPendingAfterChartScroll = false;
+let chartScrollActiveUntil = 0;
 let loadInFlight = false;
+let nextCanvasChartId = 1;
+const canvasCharts = new Map();
+const selectedBytesCache = new WeakMap();
+let lastFlattenAggregate = null;
+let lastFlattenResult = null;
 
 function parseCacheKey(cacheKey) {
   const parts = String(cacheKey || "").split("\u0000");
@@ -73,6 +86,16 @@ function flatten(aggregate) {
     }
   }
   return { requests, origins };
+}
+
+function flattenCached(aggregate) {
+  if (!aggregate || typeof aggregate !== "object") return flatten(aggregate);
+  if (aggregate === lastFlattenAggregate && lastFlattenResult) {
+    return lastFlattenResult;
+  }
+  lastFlattenAggregate = aggregate;
+  lastFlattenResult = flatten(aggregate);
+  return lastFlattenResult;
 }
 
 function groupByUri(requests, origins) {
@@ -163,7 +186,8 @@ function visibleOrigins(row) {
 }
 
 function render() {
-  const flat = flatten(state.aggregate);
+  const flat = flattenCached(state.aggregate);
+  const popIndex = indexByPop(flat);
   let rows = groupByUri(flat.requests, flat.origins).filter((row) => row.uri.includes(state.filter));
   rows = sortRows(rows);
   if (rows.length && !rows.some((row) => row.uri === state.selectedUri)) {
@@ -174,9 +198,86 @@ function render() {
   const origins = visibleOrigins(selected);
   renderTop();
   renderSidebar(flat);
-  renderMetrics(flat);
-  renderOverview(rows, flat);
+  renderMetrics(flat, popIndex);
+  renderOverview(rows, flat, popIndex);
   renderCharts(selected, reqs, origins);
+}
+
+function indexByPop(flat) {
+  const byPop = new Map();
+  const ensure = (popId) => {
+    if (!byPop.has(popId)) byPop.set(popId, { requests: [], origins: [] });
+    return byPop.get(popId);
+  };
+  for (const request of flat.requests) {
+    ensure(request.popId).requests.push(request);
+  }
+  for (const origin of flat.origins) {
+    ensure(origin.popId).origins.push(origin);
+  }
+  return byPop;
+}
+
+function renderWhenChartScrollIdle() {
+  if (Date.now() >= chartScrollActiveUntil) {
+    render();
+    return;
+  }
+  renderPendingAfterChartScroll = true;
+  scheduleDeferredRender();
+}
+
+function markChartScrollActive() {
+  chartScrollActiveUntil = Date.now() + 320;
+  scheduleChartScrollIdleWork();
+  if (renderPendingAfterChartScroll) {
+    scheduleDeferredRender();
+  }
+}
+
+function scheduleChartScrollIdleWork() {
+  if (chartScrollIdleTimer !== null) {
+    window.clearTimeout(chartScrollIdleTimer);
+  }
+  const delay = Math.max(0, chartScrollActiveUntil - Date.now());
+  chartScrollIdleTimer = window.setTimeout(() => {
+    chartScrollIdleTimer = null;
+    if (Date.now() < chartScrollActiveUntil) {
+      scheduleChartScrollIdleWork();
+      return;
+    }
+    refreshIdleChartScrollViews();
+  }, delay);
+}
+
+function refreshIdleChartScrollViews() {
+  const positionScroller = document.querySelector(".position-scroll");
+  if (positionScroller) {
+    refreshPositionTicks(positionScroller);
+    requestCanvasDrawInScroller(positionScroller);
+  }
+  const timeScroller = document.querySelector(".time-scroll");
+  if (timeScroller) {
+    refreshTimeTicks(timeScroller);
+    requestCanvasDrawInScroller(timeScroller);
+  }
+}
+
+function scheduleDeferredRender() {
+  if (deferredRenderTimer !== null) {
+    window.clearTimeout(deferredRenderTimer);
+  }
+  const delay = Math.max(0, chartScrollActiveUntil - Date.now());
+  deferredRenderTimer = window.setTimeout(() => {
+    deferredRenderTimer = null;
+    if (Date.now() < chartScrollActiveUntil) {
+      scheduleDeferredRender();
+      return;
+    }
+    if (!renderPendingAfterChartScroll) return;
+    renderPendingAfterChartScroll = false;
+    render();
+  }, delay);
 }
 
 function sortRows(rows) {
@@ -190,6 +291,15 @@ function sortRows(rows) {
 
 function hitRatio(requests) {
   return requests.length ? (requests.filter((trace) => trace.result === "HIT").length / requests.length) * 100 : 0;
+}
+
+function resultCountMap(requests) {
+  const counts = new Map();
+  for (const trace of requests) {
+    const result = trace.result || "UNKNOWN";
+    counts.set(result, (counts.get(result) || 0) + 1);
+  }
+  return counts;
 }
 
 function renderTop() {
@@ -231,19 +341,21 @@ function renderSidebar(flat) {
   ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 }
 
-function renderMetrics(flat) {
+function renderMetrics(flat, popIndex) {
   const totalReqs = flat.requests.length;
   const totalOrigins = flat.origins.length;
   const bytes = sampleBytes(state.aggregate);
   const clientBytes = bytes.client;
   const originBytes = bytes.origin;
-  const recentReqs = state.samples.slice(-12).map((sample) => flatten(sample).requests.length);
-  const recentOrigins = state.samples.slice(-12).map((sample) => flatten(sample).origins.length);
+  const recentCounts = state.samples.slice(-12).map((sample) => sampleTraceCounts(sample));
+  const recentReqs = recentCounts.map((counts) => counts.requests);
+  const recentOrigins = recentCounts.map((counts) => counts.origins);
   const throughput = throughputSamples(state.samples);
   const latestThroughput = throughput[throughput.length - 1] || { origin: 0, client: 0, intervalMs: 0 };
+  const counts = resultCountMap(flat.requests);
   const resultCounts = ["HIT", "COLLAPSED", "MISS", "SWR", "SIE"].map((name) => ({
     name,
-    value: flat.requests.filter((trace) => trace.result === name).length,
+    value: counts.get(name) || 0,
   }));
   $("metrics").innerHTML = [
     metricCard("REQUESTS", totalReqs.toLocaleString(), `${hitRatio(flat.requests).toFixed(1)}% hit`, recentReqs),
@@ -251,7 +363,7 @@ function renderMetrics(flat) {
     metricCard("ORIGIN THROUGHPUT", formatRate(latestThroughput.origin), throughputDetail(latestThroughput), throughput.map((sample) => sample.origin)),
     metricCard("CLIENT THROUGHPUT", formatRate(latestThroughput.client), throughputDetail(latestThroughput), throughput.map((sample) => sample.client)),
     donutCard(resultCounts),
-    popTable(flat),
+    popTable(popIndex),
   ].join("");
 }
 
@@ -273,6 +385,20 @@ function throughputSamples(samples) {
     });
   }
   return values;
+}
+
+function sampleTraceCounts(sample, popId = "") {
+  let requests = 0;
+  let origins = 0;
+  for (const pop of sample && sample.pops || []) {
+    if (popId && pop.id !== popId) continue;
+    const keys = (pop.snapshot && pop.snapshot.keys) || {};
+    for (const traces of Object.values(keys)) {
+      requests += (traces.requests || []).length;
+      origins += (traces.origins || []).length;
+    }
+  }
+  return { requests, origins };
 }
 
 function sampleBytes(sample) {
@@ -315,18 +441,18 @@ function donutCard(items) {
   return `<section class="panel donut-panel"><div class="metric-title">CACHE RESULT</div><div class="donut" style="background: conic-gradient(${stops})"></div><div class="legend-list">${items.map((item) => `<span><i style="background:${resultColors[item.name]}"></i>${item.name} ${item.value}</span>`).join("")}</div></section>`;
 }
 
-function popTable(flat) {
+function popTable(popIndex) {
   const rows = (state.aggregate.pops || []).map((pop) => {
-    const reqs = flat.requests.filter((trace) => trace.popId === pop.id);
+    const indexed = popIndex.get(pop.id) || { requests: [] };
     const bytes = popSampleBytes(state.aggregate, pop.id);
-    return `<div class="pop-row"><span>${escapeHtml(pop.id)}</span><b>${formatBytes(bytes.origin)}</b><b>${formatBytes(bytes.client)}</b><b>${hitRatio(reqs).toFixed(1)}%</b></div>`;
+    return `<div class="pop-row"><span>${escapeHtml(pop.id)}</span><b>${formatBytes(bytes.origin)}</b><b>${formatBytes(bytes.client)}</b><b>${hitRatio(indexed.requests).toFixed(1)}%</b></div>`;
   }).join("");
   return `<section class="panel pop-table"><div class="metric-title">STATUS (by PoP)</div><div class="pop-row"><span>PoP</span><span>Origin Data</span><span>Client Data</span><span>Hit</span></div>${rows}</section>`;
 }
 
-function renderOverview(rows, flat) {
+function renderOverview(rows, flat, popIndex) {
   if (state.overview === "pop") {
-    renderPopOverview(flat);
+    renderPopOverview(popIndex);
     return;
   }
   renderUriOverview(rows);
@@ -349,19 +475,18 @@ function renderUriOverview(rows) {
   }).join("");
 }
 
-function renderPopOverview(flat) {
+function renderPopOverview(popIndex) {
   $("overviewHead").className = "overview-head pop-overview-grid";
   $("overviewHead").innerHTML = "<span>PoP</span><span>Status</span><span>Requests</span><span>Origin Fetch</span><span>Client Throughput</span><span>Origin Throughput</span><span>Hit Ratio</span>";
   const pops = state.aggregate.pops || [];
   const summaryRows = pops.map((pop) => {
-    const reqs = flat.requests.filter((trace) => trace.popId === pop.id);
-    const origins = flat.origins.filter((trace) => trace.popId === pop.id);
+    const indexed = popIndex.get(pop.id) || { requests: [], origins: [] };
     const status = pop.error ? pop.error : pop.snapshot && pop.snapshot.enabled ? "RECORDING" : "STOPPED";
     const history = popHistory(pop.id);
     const latest = history.throughput[history.throughput.length - 1] || { client: 0, origin: 0 };
     return `<button class="overview-row pop-overview-grid" data-pop="${escapeAttr(pop.id)}">
-      <span>${escapeHtml(pop.id)}</span><span>${escapeHtml(status)}</span><span>${reqs.length}</span><span>${origins.length}</span>
-      <span>${formatRate(latest.client)}</span><span>${formatRate(latest.origin)}</span><span>${hitRatio(reqs).toFixed(1)}%</span>
+      <span>${escapeHtml(pop.id)}</span><span>${escapeHtml(status)}</span><span>${indexed.requests.length}</span><span>${indexed.origins.length}</span>
+      <span>${formatRate(latest.client)}</span><span>${formatRate(latest.origin)}</span><span>${hitRatio(indexed.requests).toFixed(1)}%</span>
     </button>`;
   }).join("");
   $("overviewRows").innerHTML = summaryRows + popThroughputHistoryTable(pops);
@@ -417,12 +542,12 @@ function popThroughputHistoryRows(pops) {
 
 function popHistory(popId) {
   const samples = state.samples.slice(-24);
-  const requests = samples.map((sample) => flatten(sample).requests.filter((trace) => trace.popId === popId).length);
+  const requests = samples.map((sample) => sampleTraceCounts(sample, popId).requests);
   const throughput = [];
   for (let i = 1; i < samples.length; i++) {
     const prev = popSampleBytes(samples[i - 1], popId);
     const curr = popSampleBytes(samples[i], popId);
-    const intervalMs = parseTimestampMs(samples[i].capturedAt || "") - parseTimestampMs(samples[i - 1].capturedAt || "");
+    const intervalMs = sampleCapturedAtMs(samples[i], popId) - sampleCapturedAtMs(samples[i - 1], popId);
     if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
       throughput.push({ client: 0, origin: 0 });
       continue;
@@ -444,6 +569,15 @@ function popSampleBytes(sample, popId) {
   };
 }
 
+function sampleCapturedAtMs(sample, popId = "") {
+  if (popId) {
+    const pop = (sample && sample.pops || []).find((item) => item.id === popId);
+    const popCapturedAt = parseTimestampMs(pop && pop.snapshot && pop.snapshot.capturedAt || "");
+    if (Number.isFinite(popCapturedAt)) return popCapturedAt;
+  }
+  return parseTimestampMs(sample && sample.capturedAt || "");
+}
+
 function renderCharts(selected, reqs, origins) {
   document.querySelector(".timeline-panel").classList.toggle("hidden", state.overview !== "uri");
   if (state.overview !== "uri") {
@@ -451,24 +585,44 @@ function renderCharts(selected, reqs, origins) {
   }
 
   rememberActiveChartScroll();
+  canvasCharts.clear();
+  nextCanvasChartId = 1;
   $("timelineTitle").innerHTML = `CHUNK POSITION VIEW<small>${selected ? escapeHtml(selected.uri) : "-"}</small>`;
   renderPositionScaleControl();
   const positionReqs = positionTraces(reqs);
   const positionOrigins = positionTraces(origins);
-  const max = Math.max(1, ...positionReqs.concat(positionOrigins).map((trace) => {
-    const base = trace.chunkStart === null ? Number(trace.start || 0) : Number(trace.chunkStart || 0);
-    return base + Number(trace.contentLength || trace.producedBytes || Math.max(1, trace.end - trace.start + 1));
-  }));
+  const max = maxTraceEndBytes(positionReqs, positionOrigins);
   ensureSelectedRequest(reqs, origins);
   $("timelineBody").innerHTML = positionView(positionOrigins, positionReqs, max);
   renderLinkedTimeView(origins, reqs);
   restorePositionScroll();
   restoreTimeScroll();
   restoreTraceYScroll();
+  initCanvasCharts();
 }
 
 function positionTraces(traces) {
   return traces.filter((trace) => !isHeadTrace(trace));
+}
+
+function maxTraceEndBytes(reqs, origins) {
+  let max = 1;
+  for (const trace of reqs) {
+    max = Math.max(max, traceEndBytes(trace));
+  }
+  for (const trace of origins) {
+    max = Math.max(max, traceEndBytes(trace));
+  }
+  return max;
+}
+
+function traceEndBytes(trace) {
+  const start = traceStartBytes(trace);
+  const end = Number(trace.end);
+  if (Number.isFinite(start) && Number.isFinite(end) && end >= start) {
+    return end + 1;
+  }
+  return start + traceWidthBytes(trace);
 }
 
 function renderLinkedTimeView(origins, reqs) {
@@ -491,16 +645,45 @@ function renderLinkedTimeView(origins, reqs) {
 }
 
 function buildTimeRequestRows(reqs, origins) {
+  const originLookup = buildOriginLookup(origins);
   return reqs.map((request) => ({
     request,
-    origin: originForRequestTrace(request, origins),
+    origin: originForRequestTrace(request, origins, originLookup),
   }));
 }
 
-function originForRequestTrace(request, origins) {
+function buildOriginLookup(origins) {
+  const exact = new Map();
+  const byCacheKey = new Map();
+  for (const origin of origins) {
+    const cacheKey = origin.cacheKey || "";
+    const popId = origin.popId || "";
+    const requestId = Number(origin.requestId || 0);
+    if (requestId) {
+      exact.set(originLookupKey(popId, requestId, cacheKey), origin);
+    }
+    const cacheOnlyKey = originLookupKey(popId, 0, cacheKey);
+    if (!byCacheKey.has(cacheOnlyKey)) {
+      byCacheKey.set(cacheOnlyKey, origin);
+    }
+  }
+  return { exact, byCacheKey };
+}
+
+function originLookupKey(popId, requestId, cacheKey) {
+  return `${popId}\u0000${requestId || 0}\u0000${cacheKey || ""}`;
+}
+
+function originForRequestTrace(request, origins, lookup = null) {
   if ((request.result || "") === "HIT") return null;
   const producerRequestId = Number(request.producerRequestId || request.requestId || 0);
   const producerCacheKey = request.producerCacheKey || request.cacheKey || "";
+  if (lookup) {
+    const exact = producerRequestId ? lookup.exact.get(originLookupKey(request.popId, producerRequestId, producerCacheKey)) : null;
+    if (exact) return exact;
+    if (producerRequestId) return null;
+    return lookup.byCacheKey.get(originLookupKey(request.popId, 0, producerCacheKey)) || null;
+  }
   return origins.find((origin) => {
     if (origin.popId !== request.popId) return false;
     if (producerRequestId && Number(origin.requestId || 0) !== producerRequestId) return false;
@@ -517,31 +700,25 @@ function rememberActiveChartScroll() {
 }
 
 function restorePositionScroll() {
-  const scrollers = [...document.querySelectorAll(".position-scroll")];
-  if (!scrollers.length) return;
+  const scroller = document.querySelector(".position-scroll");
+  if (!scroller) return;
+  const positionAnchorOffsetPx = state.positionZoomAnchorOffsetPx !== null
+    ? state.positionZoomAnchorOffsetPx
+    : Math.max(1, scroller.clientWidth - traceLabelColumnPx) * state.positionZoomAnchorRatio;
   const restoreLeft = state.positionRestoreAnchorBytes !== null
-    ? Math.max(0, positionWidthPx(state.positionRestoreAnchorBytes) - scrollers[0].clientWidth * state.positionZoomAnchorRatio)
+    ? Math.max(0, positionWidthPx(state.positionRestoreAnchorBytes) - positionAnchorOffsetPx)
     : state.positionScrollLeft;
-  for (const scroller of scrollers) {
-    scroller.scrollLeft = restoreLeft;
-  }
+  scroller.scrollLeft = restoreLeft;
+  refreshPositionTicks(scroller);
   if (state.positionRestoreAnchorBytes !== null) {
     state.positionScrollLeft = restoreLeft;
   }
   state.positionRestoreAnchorBytes = null;
-  for (const scroller of scrollers) {
-    scroller.onscroll = () => {
-      if (syncingPositionScroll) return;
-      syncingPositionScroll = true;
-      for (const other of scrollers) {
-        if (other !== scroller) {
-          other.scrollLeft = scroller.scrollLeft;
-        }
-      }
-      state.positionScrollLeft = scroller.scrollLeft;
-      syncingPositionScroll = false;
-    };
-  }
+  state.positionZoomAnchorOffsetPx = null;
+  scroller.onscroll = () => {
+    markChartScrollActive();
+    state.positionScrollLeft = scroller.scrollLeft;
+  };
 }
 
 function rememberTraceYScroll() {
@@ -571,61 +748,378 @@ function restoreTraceYScroll() {
         for (const other of scrollers) {
           if (other !== scroller) {
             other.scrollTop = scroller.scrollTop;
+            requestCanvasDrawInScroller(other);
           }
         }
+        requestCanvasDrawInScroller(scroller);
         syncingTraceYScroll = false;
       });
     }
   }
 }
 
-function restoreTimeScroll() {
-  const scrollers = [...document.querySelectorAll(".time-scroll")];
-  if (!scrollers.length) return;
-  const restoreLeft = state.timeRestoreAnchorMs !== null
-    ? Math.max(0, timeWidthPx(state.timeRestoreAnchorMs) - scrollers[0].clientWidth * state.timeZoomAnchorRatio)
-    : state.timeScrollLeft;
-  for (const scroller of scrollers) {
-    scroller.scrollLeft = restoreLeft;
-    refreshTimeTicks(scroller);
+function requestCanvasDrawInScroller(scroller) {
+  if (!scroller.querySelectorAll) return;
+  for (const canvas of scroller.querySelectorAll("canvas")) {
+    requestCanvasDraw(canvas);
   }
+}
+
+function restoreTimeScroll() {
+  const scroller = document.querySelector(".time-scroll");
+  if (!scroller) return;
+  const timeAnchorOffsetPx = state.timeZoomAnchorOffsetPx !== null
+    ? state.timeZoomAnchorOffsetPx
+    : Math.max(1, scroller.clientWidth - traceLabelColumnPx) * state.timeZoomAnchorRatio;
+  const restoreLeft = state.timeRestoreAnchorMs !== null
+    ? Math.max(0, timeWidthPx(state.timeRestoreAnchorMs) - timeAnchorOffsetPx)
+    : state.timeScrollLeft;
+  scroller.scrollLeft = restoreLeft;
+  refreshTimeTicks(scroller);
   if (state.timeRestoreAnchorMs !== null) {
     state.timeScrollLeft = restoreLeft;
   }
   state.timeRestoreAnchorMs = null;
-  for (const scroller of scrollers) {
-    scroller.onscroll = () => {
-      if (syncingTimeScroll) return;
-      syncingTimeScroll = true;
-      for (const other of scrollers) {
-        if (other !== scroller) {
-          other.scrollLeft = scroller.scrollLeft;
-          refreshTimeTicks(other);
-        }
-      }
-      state.timeScrollLeft = scroller.scrollLeft;
-      refreshTimeTicks(scroller);
-      syncingTimeScroll = false;
-    };
+  state.timeZoomAnchorOffsetPx = null;
+  scroller.onscroll = () => {
+    markChartScrollActive();
+    state.timeScrollLeft = scroller.scrollLeft;
+  };
+}
+
+function registerCanvasChart(config) {
+  const id = `canvas-chart-${nextCanvasChartId++}`;
+  canvasCharts.set(id, config);
+  return id;
+}
+
+function canvasChartHeight(rowCount) {
+  return Math.max(traceRowHeightPx, rowCount * traceRowHeightPx);
+}
+
+function initCanvasCharts() {
+  for (const scroller of document.querySelectorAll("[data-canvas-chart]")) {
+    const canvas = scroller.querySelector("canvas");
+    if (!canvas) continue;
+    requestCanvasDraw(canvas);
+    scroller.addEventListener("scroll", () => requestCanvasDraw(canvas));
   }
+}
+
+function requestCanvasDraw(canvas) {
+  if (canvas._drawQueued) return;
+  canvas._drawQueued = true;
+  window.requestAnimationFrame(() => {
+    canvas._drawQueued = false;
+    drawCanvasChart(canvas);
+  });
+}
+
+function drawCanvasChart(canvas) {
+  const scroller = canvas.closest("[data-canvas-chart]");
+  const config = scroller && canvasCharts.get(scroller.dataset.canvasChart);
+  if (!scroller || !config) return;
+
+  if (config.kind === "position-origin" || config.kind === "position-request") {
+    drawPositionCanvasChart(canvas, scroller, config);
+    return;
+  }
+  drawTimeCanvasChart(canvas, scroller, config);
+}
+
+function prepareCanvas(canvas, width, height) {
+  const dpr = window.devicePixelRatio || 1;
+  const pixelWidth = Math.ceil(width * dpr);
+  const pixelHeight = Math.ceil(height * dpr);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+}
+
+function drawPositionCanvasChart(canvas, scroller, config) {
+  const horizontalScroller = canvas.closest(".position-scroll");
+  if (!horizontalScroller) return;
+  const viewportWidth = Math.max(1, horizontalScroller.clientWidth - traceLabelColumnPx);
+  const viewportHeight = Math.max(1, scroller.clientHeight);
+  const windowRect = positionCanvasWindow(canvas, scroller, horizontalScroller, config, viewportWidth, viewportHeight);
+
+  canvas.style.position = "absolute";
+  canvas.style.left = `${windowRect.left}px`;
+  canvas.style.top = `${windowRect.top}px`;
+  prepareCanvas(canvas, windowRect.width, windowRect.height);
+  if (!windowRect.needsDraw) return;
+
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, windowRect.width, windowRect.height);
+  ctx.font = "800 10px Inter, ui-sans-serif, system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  drawPositionCanvas(ctx, config, windowRect);
+}
+
+function drawTimeCanvasChart(canvas, scroller, config) {
+  const horizontalScroller = canvas.closest(".time-scroll");
+  if (!horizontalScroller) return;
+  const viewportWidth = Math.max(1, horizontalScroller.clientWidth - traceLabelColumnPx);
+  const viewportHeight = Math.max(1, scroller.clientHeight);
+  const contentHeight = timeCanvasContentHeight(config);
+  const windowRect = horizontalCanvasWindow(canvas, scroller, horizontalScroller, config.widthPx, contentHeight, viewportWidth, viewportHeight);
+
+  canvas.style.position = "absolute";
+  canvas.style.left = `${windowRect.left}px`;
+  canvas.style.top = `${windowRect.top}px`;
+  prepareCanvas(canvas, windowRect.width, windowRect.height);
+  if (!windowRect.needsDraw) return;
+
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, windowRect.width, windowRect.height);
+  ctx.font = "800 10px Inter, ui-sans-serif, system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  drawTimeCanvas(ctx, config, windowRect);
+}
+
+function timeCanvasContentHeight(config) {
+  if (config.kind === "time-request" || config.mode === "simple") return canvasChartHeight(1);
+  return canvasChartHeight(config.rows.length);
+}
+
+function horizontalCanvasWindow(canvas, scroller, horizontalScroller, contentWidth, contentHeight, viewportWidth, viewportHeight) {
+  const drawWidth = Math.min(contentWidth, Math.max(viewportWidth, viewportWidth * 7));
+  const drawHeight = Math.min(contentHeight, Math.max(viewportHeight, viewportHeight * 3));
+  const scrollLeft = horizontalScroller.scrollLeft;
+  const scrollTop = scroller.scrollTop;
+  const currentLeft = Number(canvas.dataset.windowLeft);
+  const currentTop = Number(canvas.dataset.windowTop);
+  const currentWidth = Number(canvas.dataset.windowWidth);
+  const currentHeight = Number(canvas.dataset.windowHeight);
+  const valid = Number.isFinite(currentLeft)
+    && Number.isFinite(currentTop)
+    && currentWidth === drawWidth
+    && currentHeight === drawHeight;
+
+  let left = valid ? currentLeft : 0;
+  let top = valid ? currentTop : 0;
+  const horizontalCovered = valid
+    && scrollLeft >= left
+    && scrollLeft + viewportWidth <= left + drawWidth;
+  const verticalCovered = valid
+    && scrollTop >= top
+    && scrollTop + viewportHeight <= top + drawHeight;
+
+  if (!horizontalCovered) {
+    left = Math.min(Math.max(0, scrollLeft - viewportWidth), Math.max(0, contentWidth - drawWidth));
+  }
+  if (!verticalCovered) {
+    top = Math.min(Math.max(0, scrollTop - viewportHeight), Math.max(0, contentHeight - drawHeight));
+  }
+
+  const needsDraw = !valid || left !== currentLeft || top !== currentTop;
+  canvas.dataset.windowLeft = String(left);
+  canvas.dataset.windowTop = String(top);
+  canvas.dataset.windowWidth = String(drawWidth);
+  canvas.dataset.windowHeight = String(drawHeight);
+  return { left, top, width: drawWidth, height: drawHeight, needsDraw };
+}
+
+function positionCanvasWindow(canvas, scroller, horizontalScroller, config, viewportWidth, viewportHeight) {
+  return horizontalCanvasWindow(canvas, scroller, horizontalScroller, config.widthPx, canvasChartHeight(config.rows.length), viewportWidth, viewportHeight);
+}
+
+function drawPositionCanvas(ctx, config, windowRect) {
+  const firstRow = Math.max(0, Math.floor(windowRect.top / traceRowHeightPx) - 1);
+  const lastRow = Math.min(config.rows.length - 1, Math.ceil((windowRect.top + windowRect.height) / traceRowHeightPx) + 1);
+  const visibleLeft = windowRect.left - 4;
+  const visibleRight = windowRect.left + windowRect.width + 4;
+
+  for (let rowIndex = firstRow; rowIndex <= lastRow; rowIndex++) {
+    const row = config.rows[rowIndex];
+    if (!row) continue;
+    const traces = config.kind === "position-request" ? row.requests : row.origins;
+    const y = rowIndex * traceRowHeightPx - windowRect.top;
+    drawCanvasBarBackground(ctx, 0, y, windowRect.width);
+    for (const trace of traces) {
+      const start = positionWidthPx(positionTraceStartBytes(trace));
+      if (start > visibleRight) break;
+      const width = Math.max(0.5, positionWidthPx(traceWidthBytes(trace)));
+      if (start + width < visibleLeft) continue;
+      const result = config.kind === "position-request" ? trace.result || "UNKNOWN" : "UNKNOWN";
+      const label = width >= 24 ? chunkIdLabel(trace) : "";
+      drawCanvasSegment(ctx, start - windowRect.left, y, width, result, label);
+    }
+  }
+}
+
+function positionTraceStartBytes(trace) {
+  return traceStartBytes(trace);
+}
+
+function traceStartBytes(trace) {
+  const traceStart = Number(trace.start);
+  if (Number.isFinite(traceStart) && traceStart >= 0) return traceStart;
+  const start = Number(trace.chunkStart);
+  return Number.isFinite(start) ? start : 0;
+}
+
+function traceWidthBytes(trace) {
+  const start = traceStartBytes(trace);
+  const end = Number(trace.end);
+  const rangeWidth = Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start + 1 : 0;
+  const width = Number(rangeWidth || trace.contentLength || trace.producedBytes || 1);
+  return Number.isFinite(width) && width > 0 ? width : 1;
+}
+
+function drawTimeCanvas(ctx, config, windowRect) {
+  if (config.mode === "simple") {
+    drawSimpleTimeCanvas(ctx, config, windowRect);
+    return;
+  }
+
+  const scrollLeft = windowRect.left;
+  const scrollTop = windowRect.top;
+  const width = windowRect.width;
+  const rows = config.kind === "time-request" ? [{ request: null }] : config.rows;
+  const firstRow = Math.max(0, Math.floor(scrollTop / traceRowHeightPx) - 1);
+  const lastRow = Math.min(rows.length - 1, Math.ceil((scrollTop + windowRect.height) / traceRowHeightPx) + 1);
+  const visibleLeft = scrollLeft - 4;
+  const visibleRight = scrollLeft + width + 4;
+
+  for (let rowIndex = firstRow; rowIndex <= lastRow; rowIndex++) {
+    const y = rowIndex * traceRowHeightPx - scrollTop;
+    drawCanvasBarBackground(ctx, 0, y, width);
+    if (config.kind === "time-request") {
+      for (const row of config.rows) {
+        drawTimeTraceSegments(ctx, row.request, config, visibleLeft, visibleRight, scrollLeft, y);
+      }
+    } else {
+      drawTimeTraceSegments(ctx, rows[rowIndex].origin, config, visibleLeft, visibleRight, scrollLeft, y);
+    }
+  }
+}
+
+function drawTimeTraceSegments(ctx, trace, config, visibleLeft, visibleRight, scrollLeft, y) {
+  for (const segment of timeCanvasSegments(trace, config)) {
+    if (segment.left + segment.width < visibleLeft || segment.left > visibleRight) continue;
+    drawCanvasSegment(ctx, segment.left - scrollLeft, y, segment.width, segment.result, segment.label, segment.wait);
+  }
+}
+
+function drawSimpleTimeCanvas(ctx, config, windowRect) {
+  const scrollLeft = windowRect.left;
+  const width = windowRect.width;
+  const visibleLeft = scrollLeft - 4;
+  const visibleRight = scrollLeft + width + 4;
+  drawCanvasBarBackground(ctx, 0, 0, width);
+
+  const segment = simpleTimeCanvasSegment(config.rows, config);
+  if (!segment || segment.left + segment.width < visibleLeft || segment.left > visibleRight) return;
+  drawCanvasSegment(ctx, segment.left - scrollLeft, 0, segment.width, segment.result, "", false, segment.color);
+}
+
+function simpleTimeCanvasSegment(rows, config) {
+  let start = Infinity;
+  let end = -Infinity;
+  for (const row of rows) {
+    const trace = config.kind === "time-request" ? row.request : row.origin;
+    if (!trace) continue;
+    const traceStart = parseTimestampMs(trace.startTime || "");
+    const traceEnd = parseTimestampMs(trace.endTime || "");
+    if (!Number.isFinite(traceStart) || !Number.isFinite(traceEnd) || traceEnd < traceStart) continue;
+    start = Math.min(start, traceStart);
+    end = Math.max(end, traceEnd);
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  const left = timeLeftPx(start - config.start);
+  const width = Math.max(0.5, timeWidthPx(end - start));
+  return {
+    left,
+    width,
+    result: "UNKNOWN",
+    color: config.kind === "time-request" ? resultColors.HIT : resultColors.UNKNOWN,
+  };
+}
+
+function timeCanvasSegments(trace, config) {
+  if (!trace) return [];
+  const s = parseTimestampMs(trace.startTime || "");
+  const h = parseTimestampMs(trace.headerTime || "");
+  const e = parseTimestampMs(trace.endTime || "");
+  const bodyEnd = Number.isFinite(e) ? e : config.end;
+  const includeHeaderWait = config.kind !== "time-request";
+  const result = config.kind === "time-request" ? trace.result || "UNKNOWN" : "UNKNOWN";
+  const segmentTimeStart = Number.isFinite(h) ? h : s;
+  const segments = [];
+
+  if (includeHeaderWait && Number.isFinite(s) && Number.isFinite(h) && h > s) {
+    segments.push({
+      left: timeLeftPx(s - config.start),
+      width: Math.max(0.5, timeWidthPx(h - s)),
+      result: "UNKNOWN",
+      label: "",
+      wait: true,
+    });
+  }
+  if (Number.isFinite(segmentTimeStart) && Number.isFinite(bodyEnd) && bodyEnd >= segmentTimeStart) {
+    const width = Math.max(0.5, timeWidthPx(bodyEnd - segmentTimeStart));
+    segments.push({
+      left: timeLeftPx(segmentTimeStart - config.start),
+      width,
+      result,
+      label: width >= 24 ? traceChunkLabel(trace) : "",
+      wait: false,
+    });
+  }
+  return segments;
+}
+
+function drawCanvasBarBackground(ctx, x, y, width) {
+  ctx.fillStyle = "#0b1318";
+  ctx.fillRect(x, y, width, traceBarHeightPx);
+}
+
+function drawCanvasSegment(ctx, x, rowY, width, result, label, wait = false, color = "") {
+  const clipWidth = ctx.canvas.clientWidth || width;
+  const clippedX = Math.max(0, x);
+  const clippedRight = Math.min(clipWidth, x + width);
+  if (clippedRight <= clippedX) return;
+  const y = rowY + 2;
+  const height = traceBarHeightPx - 4;
+  ctx.fillStyle = color || (wait ? "#8395aa" : resultColors[result] || resultColors.UNKNOWN);
+  ctx.fillRect(clippedX, y, Math.max(0.5, clippedRight - clippedX), height);
+  if (!label || width < 24) return;
+  const labelX = x + width / 2;
+  if (labelX < 0 || labelX > clipWidth) return;
+  ctx.fillStyle = "#061014";
+  ctx.fillText(label, labelX, y + height / 2);
 }
 
 function positionView(origins, reqs, maxBytes) {
   const widthPx = Math.max(1600, Math.ceil(maxBytes / state.positionScaleBytes) * positionGridWidthPx);
   const rows = positionRows(reqs, origins);
   const trackStyle = `--position-width:${widthPx}px;--track-width:${widthPx}px;--grid-width:${positionGridWidthPx}px`;
-  return `<div class="position-view-stack">
-    ${positionSection("ORIGIN FETCH", "position-origin", positionLabels(rows), positionOriginBars(rows, widthPx), maxBytes, widthPx, trackStyle)}
-    ${positionSection("CLIENT REQUESTS", "position-request", positionLabels(rows), positionRequestBars(rows, widthPx), maxBytes, widthPx, trackStyle)}
+  return `<div class="position-scroll position-h-scroll">
+    <div class="position-view-stack position-wide" style="--position-width:${widthPx}px">
+      ${positionSection("ORIGIN FETCH", "position-origin", positionLabels(rows), maxBytes, widthPx, trackStyle, registerCanvasChart({ kind: "position-origin", rows, widthPx }))}
+      ${positionSection("CLIENT REQUESTS", "position-request", positionLabels(rows), maxBytes, widthPx, trackStyle, registerCanvasChart({ kind: "position-request", rows, widthPx }))}
+    </div>
   </div>`;
 }
 
-function positionSection(title, scrollGroup, labels, bars, maxBytes, widthPx, trackStyle) {
+function positionSection(title, scrollGroup, labels, maxBytes, widthPx, trackStyle, chartId) {
   return `<div class="trace-section position-trace-section">
     <div class="trace-section-head">
       <div class="position-labels"><div class="position-axis-spacer"></div><h3>${escapeHtml(title)}</h3></div>
-      <div class="position-scroll trace-axis-scroll">
-        <div class="position-track" style="${trackStyle}">
+      <div class="position-axis-pane trace-axis-scroll">
+        <div class="position-track" data-max-bytes="${escapeAttr(maxBytes)}" style="${trackStyle}">
           ${positionMarker(widthPx)}
           ${positionAxis(maxBytes)}
         </div>
@@ -633,11 +1127,11 @@ function positionSection(title, scrollGroup, labels, bars, maxBytes, widthPx, tr
     </div>
     <div class="trace-section-body">
       <div class="position-labels trace-y-scroll trace-label-scroll" data-y-scroll="${escapeAttr(scrollGroup)}">${labels}</div>
-      <div class="position-scroll trace-y-scroll trace-chart-scroll" data-y-scroll="${escapeAttr(scrollGroup)}">
-        <div class="position-track" style="${trackStyle}">
+      <div class="position-chart-pane trace-y-scroll trace-chart-scroll canvas-chart-scroll" data-y-scroll="${escapeAttr(scrollGroup)}" data-canvas-chart="${escapeAttr(chartId)}">
+        <div class="position-track canvas-scroll-spacer" data-max-bytes="${escapeAttr(maxBytes)}" style="${trackStyle};height:${canvasChartHeight(canvasCharts.get(chartId).rows.length)}px">
           ${positionMarker(widthPx)}
           ${positionGrid(maxBytes, "time-grid body-grid")}
-          <div class="chart">${bars}</div>
+          <canvas class="trace-canvas"></canvas>
         </div>
       </div>
     </div>
@@ -646,23 +1140,27 @@ function positionSection(title, scrollGroup, labels, bars, maxBytes, widthPx, tr
 
 function positionRows(reqs, origins) {
   const rows = new Map();
+  const originLookup = buildOriginLookup(origins);
   for (const request of reqs) {
     const key = requestKey(request);
     if (!rows.has(key)) {
-      rows.set(key, { popId: request.popId, requestId: request.requestId, requests: [], origins: [] });
+      rows.set(key, { popId: request.popId, requestId: request.requestId, requests: [], origins: [], originKeys: new Set() });
     }
     const row = rows.get(key);
     row.requests.push(request);
-    const origin = originForRequestTrace(request, origins);
-    if (origin && !row.origins.some((item) => traceKey(item) === traceKey(origin))) {
+    const origin = originForRequestTrace(request, origins, originLookup);
+    const originKey = origin && traceKey(origin);
+    if (origin && !row.originKeys.has(originKey)) {
       row.origins.push(origin);
+      row.originKeys.add(originKey);
     }
   }
   return [...rows.values()].map((row) => ({
-    ...row,
+    popId: row.popId,
+    requestId: row.requestId,
     requests: row.requests.sort(compareTimeViewTrace),
     origins: row.origins.sort(compareTimeViewTrace),
-  })).sort((a, b) => a.requestId - b.requestId || a.popId.localeCompare(b.popId));
+  })).sort((a, b) => b.requestId - a.requestId || b.popId.localeCompare(a.popId));
 }
 
 function positionLabels(rows) {
@@ -672,36 +1170,9 @@ function positionLabels(rows) {
   }).join("");
 }
 
-function positionOriginBars(rows, widthPx) {
-  if (!rows.length) return `<div class="empty position-bar-row" style="--position-width:${widthPx}px"></div>`;
-  return rows.map((row) => {
-    const segments = row.origins.map((trace) => positionSegment(trace, false)).join("");
-    return `<button class="position-bar-row" data-request-row="${escapeAttr(`${row.popId}:${row.requestId}`)}" style="--position-width:${widthPx}px"><i class="bar-bg">${segments}</i></button>`;
-  }).join("");
-}
-
-function positionRequestBars(rows, widthPx) {
-  if (!rows.length) return `<div class="empty position-bar-row" style="--position-width:${widthPx}px"></div>`;
-  return rows.map((row) => {
-    const segments = row.requests.map((trace) => positionSegment(trace, true)).join("");
-    return `<button class="position-bar-row" data-request-row="${escapeAttr(`${row.popId}:${row.requestId}`)}" style="--position-width:${widthPx}px"><i class="bar-bg">${segments}</i></button>`;
-  }).join("");
-}
-
-function positionSegment(trace, showResult) {
-  const start = trace.chunkStart === null || trace.chunkStart === undefined ? Number(trace.start || 0) : Number(trace.chunkStart || 0);
-  const widthBytes = Number(trace.contentLength || trace.producedBytes || Math.max(1, trace.end - trace.start + 1));
-  const result = showResult ? trace.result || "UNKNOWN" : "UNKNOWN";
-  const label = showResult ? result : "FETCH";
-  const segmentWidth = Math.max(1, positionWidthPx(widthBytes));
-  const chunkLabel = segmentWidth >= 24 ? chunkIdLabel(trace) : "";
-  return `<b class="segment result-${escapeAttr(result)}" title="${escapeAttr(`${label}: ${formatBytes(start)} - ${formatBytes(start + widthBytes)}`)}" style="left:${positionWidthPx(start)}px;width:${segmentWidth}px">${escapeHtml(chunkLabel)}</b>`;
-}
-
 function chunkIdLabel(trace) {
   if (isHeadTrace(trace)) return "HEAD";
-  if (trace.chunkStart === null || trace.chunkStart === undefined) return "";
-  const start = Number(trace.chunkStart);
+  const start = traceStartBytes(trace);
   if (!Number.isFinite(start) || start <= 0) return "c0";
   return `c${Math.floor(start / 1048576)}`;
 }
@@ -721,33 +1192,75 @@ function positionMarker(widthPx) {
 }
 
 function positionAxis(maxBytes) {
-  const ticks = Math.ceil(maxBytes / state.positionScaleBytes);
-  const labelStep = positionTickStep(maxBytes);
-  let html = `<div class="position-axis"><i class="bar-bg">`;
-  for (let i = 0; i <= ticks; i += labelStep) {
-    html += `<b class="${i === 0 ? "edge-start" : ""}" style="left:${i * positionGridWidthPx}px">${escapeHtml(formatBytes(state.positionScaleBytes * i))}</b>`;
-  }
-  if (ticks % labelStep !== 0) {
-    html += `<b class="edge-end" style="left:${positionWidthPx(maxBytes)}px">${escapeHtml(formatBytes(maxBytes))}</b>`;
-  }
-  return `${html}</i></div>`;
+  return `<div class="position-axis"><i class="bar-bg">${positionAxisTickHtml(maxBytes, null)}</i></div>`;
 }
 
 function positionGrid(maxBytes, className = "time-grid") {
-  const ticks = Math.ceil(maxBytes / state.positionScaleBytes);
-  const labelStep = positionTickStep(maxBytes);
-  let html = `<div class="${className}">`;
-  for (let i = 0; i <= ticks; i += labelStep) {
-    html += `<i style="left:${i * positionGridWidthPx}px"></i>`;
-  }
-  if (ticks % labelStep !== 0) {
-    html += `<i style="left:${positionWidthPx(maxBytes)}px"></i>`;
-  }
-  return `${html}</div>`;
+  return `<div class="${className}">${positionGridTickHtml(maxBytes, null)}</div>`;
 }
 
 function positionTickStep(maxBytes) {
   return Math.max(1, Math.ceil(Math.ceil(maxBytes / state.positionScaleBytes) / 600));
+}
+
+function refreshPositionTicks(scroller) {
+  for (const track of scroller.querySelectorAll(".position-track")) {
+    const maxBytes = Number(track.dataset.maxBytes || 0);
+    const axis = track.querySelector(".position-axis .bar-bg");
+    const grid = track.querySelector(".time-grid");
+    if (!Number.isFinite(maxBytes) || maxBytes <= 0) continue;
+    if (axis) axis.innerHTML = positionAxisTickHtml(maxBytes, scroller);
+    if (grid) grid.innerHTML = positionGridTickHtml(maxBytes, scroller);
+  }
+}
+
+function positionAxisTickHtml(maxBytes, scroller) {
+  let html = "";
+  for (const tick of visiblePositionTicks(maxBytes, scroller)) {
+    html += `<b class="${tick.className}" style="left:${tick.left}px">${escapeHtml(tick.label)}</b>`;
+  }
+  return html;
+}
+
+function positionGridTickHtml(maxBytes, scroller) {
+  let html = "";
+  for (const tick of visiblePositionTicks(maxBytes, scroller)) {
+    html += `<i style="left:${tick.left}px"></i>`;
+  }
+  return html;
+}
+
+function visiblePositionTicks(maxBytes, scroller) {
+  const bounds = visiblePositionTickBounds(maxBytes, scroller);
+  const ticks = [];
+  for (let i = bounds.start; i <= bounds.end; i += bounds.step) {
+    ticks.push({
+      left: i * positionGridWidthPx,
+      label: formatBytes(Math.min(maxBytes, state.positionScaleBytes * i)),
+      className: i === 0 ? "edge-start" : "",
+    });
+  }
+  const endLeft = positionWidthPx(maxBytes);
+  if (endLeft >= bounds.leftPx && endLeft <= bounds.rightPx && bounds.ticks % bounds.step !== 0) {
+    ticks.push({
+      left: endLeft,
+      label: formatBytes(maxBytes),
+      className: "edge-end",
+    });
+  }
+  return ticks;
+}
+
+function visiblePositionTickBounds(maxBytes, scroller) {
+  const ticks = Math.ceil(maxBytes / state.positionScaleBytes);
+  const step = positionTickStep(maxBytes);
+  const scrollLeft = scroller ? scroller.scrollLeft : state.positionScrollLeft;
+  const width = scroller && scroller.clientWidth > 0 ? Math.max(1, scroller.clientWidth - traceLabelColumnPx) : 1600;
+  const leftPx = Math.max(0, scrollLeft - width);
+  const rightPx = Math.min(positionWidthPx(maxBytes), scrollLeft + width * 2);
+  const start = Math.max(0, Math.floor(leftPx / positionGridWidthPx / step) * step);
+  const end = Math.min(ticks, Math.ceil(rightPx / positionGridWidthPx / step) * step);
+  return { ticks, step, start, end, leftPx, rightPx };
 }
 
 function positionWidthPx(bytes) {
@@ -758,31 +1271,13 @@ function timeView(rows, start, end, range) {
   const widthPx = Math.max(1600, Math.ceil(range / state.timeScaleMs) * timeGridWidthPx);
   const marker = timeMarker(widthPx);
   const trackStyle = `--time-width:${widthPx}px;--track-width:${widthPx}px;--grid-width:${timeGridWidthPx}px`;
-  return `<div class="time-client-pinned">
-    <div class="time-labels">
-      <div class="time-axis-spacer"></div>
-      <h3>CLIENT REQUESTS</h3>
-      ${timeRequestLabels(rows)}
-    </div>
-    <div class="time-scroll">
-      <div class="time-track" data-range="${range}" style="${trackStyle}">
-        ${marker}
-        ${timeAxis(range)}
-        ${timeGrid(range)}
-        <div class="time-section-spacer"></div>
-        <div class="chart">${timeRequestBars(rows, start, end, widthPx)}</div>
-      </div>
-    </div>
-  </div>
-  ${timeOriginSection(rows, start, end, range, widthPx, marker, trackStyle)}
-  ${throughputView(start, end, range, widthPx, marker, trackStyle)}`;
-}
-
-function timeOriginSection(rows, start, end, range, widthPx, marker, trackStyle) {
-  return `<div class="trace-section time-origin-section">
+  const requestChartId = registerCanvasChart({ kind: "time-request", mode: state.timeViewMode, rows, start, end, widthPx });
+  return `<div class="time-scroll time-h-scroll">
+  <div class="time-view-stack time-wide" style="--time-width:${widthPx}px">
+  <div class="time-client-pinned trace-section">
     <div class="trace-section-head">
-      <div class="time-labels"><div class="time-axis-spacer"></div><h3>ORIGIN FETCH</h3></div>
-      <div class="time-scroll trace-axis-scroll">
+      <div class="time-labels"><div class="time-axis-spacer"></div><h3>CLIENT REQUESTS</h3></div>
+      <div class="time-axis-pane trace-axis-scroll">
         <div class="time-track" data-range="${range}" style="${trackStyle}">
           ${marker}
           ${timeAxis(range)}
@@ -790,12 +1285,43 @@ function timeOriginSection(rows, start, end, range, widthPx, marker, trackStyle)
       </div>
     </div>
     <div class="trace-section-body">
-      <div class="time-labels trace-y-scroll trace-label-scroll" data-y-scroll="time-origin">${timeOriginLabels(rows)}</div>
-      <div class="time-scroll trace-y-scroll trace-chart-scroll" data-y-scroll="time-origin">
-        <div class="time-track" data-range="${range}" style="${trackStyle}">
+      <div class="time-labels trace-label-scroll">${timeRequestLabels(rows)}</div>
+      <div class="time-chart-pane canvas-chart-scroll" data-canvas-chart="${escapeAttr(requestChartId)}">
+        <div class="time-track canvas-scroll-spacer" data-range="${range}" style="${trackStyle};height:${canvasChartHeight(1)}px">
           ${marker}
           ${timeGrid(range, "time-grid body-grid")}
-          <div class="chart">${timeOriginBars(rows, start, end, widthPx)}</div>
+          <canvas class="trace-canvas"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+  ${timeOriginSection(rows, start, end, range, widthPx, marker, trackStyle)}
+  ${throughputView(start, end, range, widthPx, marker, trackStyle)}
+  </div>
+  </div>`;
+}
+
+function timeOriginSection(rows, start, end, range, widthPx, marker, trackStyle) {
+  const originRows = rows.filter((row) => row.origin);
+  const rowCount = state.timeViewMode === "simple" ? 1 : originRows.length;
+  const chartId = registerCanvasChart({ kind: "time-origin", mode: state.timeViewMode, rows: originRows, start, end, widthPx });
+  return `<div class="trace-section time-origin-section">
+    <div class="trace-section-head">
+      <div class="time-labels"><div class="time-axis-spacer"></div><h3>ORIGIN FETCH</h3></div>
+      <div class="time-axis-pane trace-axis-scroll">
+        <div class="time-track" data-range="${range}" style="${trackStyle}">
+          ${marker}
+          ${timeAxis(range)}
+        </div>
+      </div>
+    </div>
+    <div class="trace-section-body">
+      <div class="time-labels trace-y-scroll trace-label-scroll" data-y-scroll="time-origin">${timeOriginLabelsForMode(rows)}</div>
+      <div class="time-chart-pane trace-y-scroll trace-chart-scroll canvas-chart-scroll" data-y-scroll="time-origin" data-canvas-chart="${escapeAttr(chartId)}">
+        <div class="time-track canvas-scroll-spacer" data-range="${range}" style="${trackStyle};height:${canvasChartHeight(rowCount)}px">
+          ${marker}
+          ${timeGrid(range, "time-grid body-grid")}
+          <canvas class="trace-canvas"></canvas>
         </div>
       </div>
     </div>
@@ -816,7 +1342,7 @@ function throughputView(start, end, range, widthPx, marker, trackStyle) {
       <div class="throughput-label"><i class="throughput-key client"></i><span>Client</span></div>
       <div class="throughput-label"><i class="throughput-key origin"></i><span>Origin</span></div>
     </div>
-    <div class="time-scroll">
+    <div class="time-chart-pane">
       <div class="time-track" data-range="${range}" style="${trackStyle}">
         ${marker}
         ${timeAxis(range)}
@@ -848,9 +1374,10 @@ function throughputGraph(start, end, widthPx) {
 function selectedRequestThroughputSeries(kind, start, end) {
   const points = [{ t: start, value: 0 }];
   const samples = state.samples;
+  const popId = selectedRequestPopId();
   for (let i = 1; i < samples.length; i++) {
-    const prevAt = parseTimestampMs(samples[i - 1].capturedAt || "");
-    const currAt = parseTimestampMs(samples[i].capturedAt || "");
+    const prevAt = sampleCapturedAtMs(samples[i - 1], popId);
+    const currAt = sampleCapturedAtMs(samples[i], popId);
     const intervalMs = currAt - prevAt;
     if (!Number.isFinite(intervalMs) || intervalMs <= 0) continue;
     const windowStart = Math.max(start, prevAt);
@@ -868,6 +1395,10 @@ function selectedRequestThroughputSeries(kind, start, end) {
   return points;
 }
 
+function selectedRequestPopId() {
+  return String(state.selectedRequestKey || "").split(":")[0] || "";
+}
+
 function appendThroughputWindow(points, start, end, value) {
   const last = points[points.length - 1];
   if (start > last.t) {
@@ -880,18 +1411,63 @@ function appendThroughputWindow(points, start, end, value) {
 
 function selectedRequestSampleBytes(sample) {
   if (!state.selectedRequestKey) return { client: 0, origin: 0 };
-  const flat = flatten(sample);
-  const requests = flat.requests.filter((trace) => requestKey(trace) === state.selectedRequestKey);
-  const origins = [];
-  for (const request of requests) {
-    const origin = originForRequestTrace(request, flat.origins);
-    if (origin && !origins.some((item) => traceKey(item) === traceKey(origin))) {
-      origins.push(origin);
+  let byRequest = selectedBytesCache.get(sample);
+  if (!byRequest) {
+    byRequest = new Map();
+    selectedBytesCache.set(sample, byRequest);
+  }
+  const cached = byRequest.get(state.selectedRequestKey);
+  if (cached) return cached;
+
+  const bytes = selectedRequestSampleBytesRaw(sample, state.selectedRequestKey);
+  byRequest.set(state.selectedRequestKey, bytes);
+  return bytes;
+}
+
+function selectedRequestSampleBytesRaw(sample, selectedKey) {
+  const [selectedPopId, selectedRequestIdText] = String(selectedKey).split(":");
+  const selectedRequestId = Number(selectedRequestIdText || 0);
+  const requests = [];
+  const wantedOriginKeys = new Set();
+  for (const pop of sample && sample.pops || []) {
+    if (pop.id !== selectedPopId) continue;
+    const keys = (pop.snapshot && pop.snapshot.keys) || {};
+    for (const [cacheKey, traces] of Object.entries(keys)) {
+      const parsed = parseCacheKey(cacheKey);
+      for (const request of traces.requests || []) {
+        if (Number(request.requestId || 0) !== selectedRequestId) continue;
+        requests.push({ ...request, ...parsed, cacheKey, popId: pop.id, popURL: pop.url, kind: "request" });
+        if ((request.result || "") !== "HIT") {
+          wantedOriginKeys.add(request.producerCacheKey || cacheKey);
+        }
+      }
     }
+    const origins = [];
+    for (const [cacheKey, traces] of Object.entries(keys)) {
+      if (!wantedOriginKeys.has(cacheKey)) continue;
+      const parsed = parseCacheKey(cacheKey);
+      for (const origin of traces.origins || []) {
+        origins.push({ ...origin, ...parsed, cacheKey, popId: pop.id, popURL: pop.url, kind: "origin" });
+      }
+    }
+    const originLookup = buildOriginLookup(origins);
+    const originKeys = new Set();
+    let originBytes = 0;
+    for (const request of requests) {
+      const origin = originForRequestTrace(request, origins, originLookup);
+      const key = origin && traceKey(origin);
+      if (!origin || originKeys.has(key)) continue;
+      originBytes += Math.max(0, Number(origin.producedBytes || 0));
+      originKeys.add(key);
+    }
+    return {
+      client: sumBytes(requests),
+      origin: originBytes,
+    };
   }
   return {
     client: sumBytes(requests),
-    origin: sumBytes(origins),
+    origin: 0,
   };
 }
 
@@ -930,7 +1506,7 @@ function timeRowLabels(rows) {
   if (!rows.length) return `<div class="time-label-row empty">No trace</div>`;
   return rows.map((row) => {
     const trace = row.request;
-    return `<button class="time-label-row" data-trace="${escapeAttr(traceKey(trace))}">${escapeHtml(traceChunkLabel(trace))}</button>`;
+    return `<button class="time-label-row">${escapeHtml(traceChunkLabel(trace))}</button>`;
   }).join("");
 }
 
@@ -939,43 +1515,14 @@ function timeOriginLabels(rows) {
   return timeRowLabels(originRows);
 }
 
+function timeOriginLabelsForMode(rows) {
+  if (state.timeViewMode === "detail") return timeOriginLabels(rows);
+  return rows.some((row) => row.origin) ? `<button class="time-label-row">origin</button>` : `<div class="time-label-row empty">No trace</div>`;
+}
+
 function timeRequestLabels(rows) {
   if (!rows.length) return `<div class="time-label-row empty">No trace</div>`;
   return `<button class="time-label-row request-label" data-request-row="${escapeAttr(requestKey(rows[0].request))}">req</button>`;
-}
-
-function timeOriginBars(rows, start, end, widthPx) {
-  const originRows = rows.filter((row) => row.origin);
-  if (!originRows.length) return `<div class="empty time-bar-row" style="--time-width:${widthPx}px"></div>`;
-  return originRows.map((row) => {
-    const segments = timeSegments(row.origin, start, end, false);
-    return `<button class="time-bar-row" data-trace="${escapeAttr(traceKey(row.request))}" style="--time-width:${widthPx}px"><i class="bar-bg">${segments}</i></button>`;
-  }).join("");
-}
-
-function timeRequestBars(rows, start, end, widthPx) {
-  if (!rows.length) return `<div class="empty time-bar-row" style="--time-width:${widthPx}px"></div>`;
-  const segments = rows.map((row) => timeSegments(row.request, start, end, true)).join("");
-  return `<button class="time-bar-row request-row" data-request-row="${escapeAttr(requestKey(rows[0].request))}" style="--time-width:${widthPx}px"><i class="bar-bg">${segments}</i></button>`;
-}
-
-function timeSegments(trace, start, end, showResult, layerClass = "") {
-  const s = parseTimestampMs(trace.startTime || "");
-  const h = parseTimestampMs(trace.headerTime || "");
-  const e = parseTimestampMs(trace.endTime || "");
-  const left = Number.isFinite(s) ? timeLeftPx(s - start) : 0;
-  const headerWidth = Number.isFinite(h) && Number.isFinite(s) ? Math.max(1, timeWidthPx(h - s)) : 2;
-  const includeHeaderWait = !showResult;
-  const bodyEnd = Number.isFinite(e) ? e : end;
-  const result = showResult ? trace.result || "UNKNOWN" : "UNKNOWN";
-  const bodyLabel = showResult ? result : "FETCH";
-  const segmentTimeStart = Number.isFinite(h) ? h : s;
-  const bodyStart = timeLeftPx(segmentTimeStart - start);
-  const bodyWidth = Number.isFinite(bodyEnd) ? Math.max(1, timeWidthPx(bodyEnd - segmentTimeStart)) : 4;
-  const chunkLabel = traceChunkLabel(trace);
-  const layer = layerClass ? ` ${layerClass}` : "";
-  const header = includeHeaderWait ? `<b class="segment wait-segment${layer}" title="${escapeAttr(relativeRangeTitle("HEADER_WAIT", s, h, start))}" style="left:${left}px;width:${headerWidth}px"></b>` : "";
-  return `${header}<b class="segment result-${escapeAttr(result)}${layer}" title="${escapeAttr(relativeRangeTitle(bodyLabel, segmentTimeStart, bodyEnd, start))}" style="left:${bodyStart}px;width:${bodyWidth}px">${escapeHtml(chunkLabel)}</b>`;
 }
 
 function captureStartTime() {
@@ -1000,9 +1547,11 @@ function captureEndTime() {
 
 function renderTimeScaleControl() {
   $("timeScaleControl").classList.toggle("hidden", state.overview !== "uri" || !state.selectedRequestKey);
+  $("timeModeControl").classList.toggle("hidden", state.overview !== "uri" || !state.selectedRequestKey);
   $("timeScaleSlider").max = String(timeScaleValuesMs.length - 1);
   $("timeScaleSlider").value = String(timeScaleValuesMs.length - 1 - state.timeScaleIndex);
   $("timeScaleValue").textContent = `${formatScaleMs(state.timeScaleMs)} / grid`;
+  $("timeViewMode").value = state.timeViewMode;
 }
 
 function renderPositionScaleControl() {
@@ -1055,8 +1604,7 @@ function traceOrderRank(trace) {
 }
 
 function traceChunkStart(trace) {
-  const start = trace.chunkStart === null || trace.chunkStart === undefined ? Number(trace.start || 0) : Number(trace.chunkStart || 0);
-  return Number.isFinite(start) ? start : 0;
+  return traceStartBytes(trace);
 }
 
 function timeLeftPx(ms) {
@@ -1076,49 +1624,58 @@ function timeGrid(range, className = "time-grid") {
 }
 
 function refreshTimeTicks(scroller) {
-  const track = scroller.querySelector(".time-track");
-  if (!track) return;
-  const range = Number(track.dataset.range || 0);
-  const axis = track.querySelector(".time-axis .bar-bg");
-  const grid = track.querySelector(".time-grid");
-  if (!Number.isFinite(range) || range <= 0) return;
-  if (axis) axis.innerHTML = timeAxisTickHtml(range, scroller);
-  if (grid) grid.innerHTML = timeGridTickHtml(range, scroller);
+  for (const track of scroller.querySelectorAll(".time-track")) {
+    const range = Number(track.dataset.range || 0);
+    const axis = track.querySelector(".time-axis .bar-bg");
+    const grid = track.querySelector(".time-grid");
+    if (!Number.isFinite(range) || range <= 0) continue;
+    if (axis) axis.innerHTML = timeAxisTickHtml(range, scroller);
+    if (grid) grid.innerHTML = timeGridTickHtml(range, scroller);
+  }
 }
 
 function timeAxisTickHtml(range, scroller) {
-  const bounds = visibleTimeTickBounds(range, scroller);
   let html = "";
-  for (let i = bounds.start; i <= bounds.end; i += bounds.step) {
-    const left = i * timeGridWidthPx;
-    const label = formatScaleMs(Math.min(range, state.timeScaleMs * i));
-    html += `<b class="${i === 0 ? "edge-start" : ""}" style="left:${left}px">${escapeHtml(label)}</b>`;
-  }
-  const endLeft = timeWidthPx(range);
-  if (endLeft >= bounds.leftPx && endLeft <= bounds.rightPx && bounds.ticks % bounds.step !== 0) {
-    html += `<b class="edge-end" style="left:${endLeft}px">${escapeHtml(formatScaleMs(range))}</b>`;
+  for (const tick of visibleTimeTicks(range, scroller)) {
+    html += `<b class="${tick.className}" style="left:${tick.left}px">${escapeHtml(tick.label)}</b>`;
   }
   return html;
 }
 
 function timeGridTickHtml(range, scroller) {
-  const bounds = visibleTimeTickBounds(range, scroller);
   let html = "";
+  for (const tick of visibleTimeTicks(range, scroller)) {
+    html += `<i style="left:${tick.left}px"></i>`;
+  }
+  return html;
+}
+
+function visibleTimeTicks(range, scroller) {
+  const bounds = visibleTimeTickBounds(range, scroller);
+  const ticks = [];
   for (let i = bounds.start; i <= bounds.end; i += bounds.step) {
-    html += `<i style="left:${i * timeGridWidthPx}px"></i>`;
+    ticks.push({
+      left: i * timeGridWidthPx,
+      label: formatScaleMs(Math.min(range, state.timeScaleMs * i)),
+      className: i === 0 ? "edge-start" : "",
+    });
   }
   const endLeft = timeWidthPx(range);
   if (endLeft >= bounds.leftPx && endLeft <= bounds.rightPx && bounds.ticks % bounds.step !== 0) {
-    html += `<i style="left:${endLeft}px"></i>`;
+    ticks.push({
+      left: endLeft,
+      label: formatScaleMs(range),
+      className: "edge-end",
+    });
   }
-  return html;
+  return ticks;
 }
 
 function visibleTimeTickBounds(range, scroller) {
   const ticks = Math.ceil(range / state.timeScaleMs);
   const step = Math.max(1, Math.ceil(92 / timeGridWidthPx));
   const scrollLeft = scroller ? scroller.scrollLeft : state.timeScrollLeft;
-  const width = scroller && scroller.clientWidth > 0 ? scroller.clientWidth : 1600;
+  const width = scroller && scroller.clientWidth > 0 ? Math.max(1, scroller.clientWidth - traceLabelColumnPx) : 1600;
   const leftPx = Math.max(0, scrollLeft - width);
   const rightPx = Math.min(timeWidthPx(range), scrollLeft + width * 2);
   const start = Math.max(0, Math.floor(leftPx / timeGridWidthPx / step) * step);
@@ -1183,7 +1740,7 @@ async function load() {
   } finally {
     loadInFlight = false;
   }
-  render();
+  renderWhenChartScrollIdle();
 }
 
 function stopAutoRefreshIfStopped() {
@@ -1309,6 +1866,11 @@ function demoAggregate() {
 }
 
 document.addEventListener("click", (event) => {
+  const canvasScroller = event.target.closest("[data-canvas-chart]");
+  if (canvasScroller) {
+    handleCanvasChartClick(event, canvasScroller);
+    return;
+  }
   const timeTrack = event.target.closest(".time-track");
   if (timeTrack) {
     setTimeZoomAnchor(event);
@@ -1342,6 +1904,83 @@ document.addEventListener("click", (event) => {
   }
 });
 
+function handleCanvasChartClick(event, scroller) {
+  const config = canvasCharts.get(scroller.dataset.canvasChart);
+  if (!config) return;
+  if (config.kind === "position-origin" || config.kind === "position-request") {
+    const point = positionCanvasPointFromEvent(event, scroller);
+    if (!point) return;
+    const { x, y, width, horizontalScroller } = point;
+    state.positionZoomAnchorRatio = width > 0 ? x / width : 0.5;
+    state.positionZoomAnchorOffsetPx = x;
+    state.positionZoomAnchorBytes = Math.max(0, (horizontalScroller.scrollLeft + x) / positionGridWidthPx * state.positionScaleBytes);
+    state.positionRestoreAnchorBytes = state.positionZoomAnchorBytes;
+    const rowIndex = Math.floor((scroller.scrollTop + y) / traceRowHeightPx);
+    const rowY = (scroller.scrollTop + y) - rowIndex * traceRowHeightPx;
+    const row = config.rows[rowIndex];
+    if (row && rowY >= 0 && rowY <= traceBarHeightPx) {
+      state.selectedRequestKey = `${row.popId}:${row.requestId}`;
+    }
+    render();
+    return;
+  }
+
+  const point = timeCanvasPointFromEvent(event, scroller);
+  if (!point) return;
+  const { x, width, horizontalScroller } = point;
+  state.timeZoomAnchorRatio = width > 0 ? x / width : 0.5;
+  state.timeZoomAnchorOffsetPx = x;
+  state.timeZoomAnchorMs = Math.max(0, (horizontalScroller.scrollLeft + x) / timeGridWidthPx * state.timeScaleMs);
+  state.timeRestoreAnchorMs = state.timeZoomAnchorMs;
+  render();
+}
+
+function positionCanvasPointFromEvent(event, scroller) {
+  const horizontalScroller = scroller.closest(".position-scroll");
+  if (!horizontalScroller) return null;
+  const horizontalRect = horizontalScroller.getBoundingClientRect();
+  const scrollerRect = scroller.getBoundingClientRect();
+  const left = horizontalRect.left + horizontalScroller.clientLeft + traceLabelColumnPx;
+  const top = scrollerRect.top + scroller.clientTop;
+  const width = Math.max(1, horizontalScroller.clientWidth - traceLabelColumnPx);
+  const height = scroller.clientHeight;
+  const x = event.clientX - left;
+  const y = event.clientY - top;
+  if (x < 0 || x > width || y < 0 || y > height) {
+    return null;
+  }
+  return {
+    x,
+    y,
+    width,
+    height,
+    horizontalScroller,
+  };
+}
+
+function timeCanvasPointFromEvent(event, scroller) {
+  const horizontalScroller = scroller.closest(".time-scroll");
+  if (!horizontalScroller) return null;
+  const horizontalRect = horizontalScroller.getBoundingClientRect();
+  const scrollerRect = scroller.getBoundingClientRect();
+  const left = horizontalRect.left + horizontalScroller.clientLeft + traceLabelColumnPx;
+  const top = scrollerRect.top + scroller.clientTop;
+  const width = Math.max(1, horizontalScroller.clientWidth - traceLabelColumnPx);
+  const height = scroller.clientHeight;
+  const x = event.clientX - left;
+  const y = event.clientY - top;
+  if (x < 0 || x > width || y < 0 || y > height) {
+    return null;
+  }
+  return {
+    x,
+    y,
+    width,
+    height,
+    horizontalScroller,
+  };
+}
+
 $("uriFilter").addEventListener("input", (event) => {
   state.filter = event.target.value;
   render();
@@ -1354,6 +1993,12 @@ $("sortBy").addEventListener("change", (event) => {
 
 $("timeScaleSlider").addEventListener("input", (event) => {
   updateTimeScale(Number(event.target.value) || 0);
+});
+
+$("timeViewMode").addEventListener("change", (event) => {
+  state.timeViewMode = event.target.value === "detail" ? "detail" : "simple";
+  state.traceYScroll["time-origin"] = 0;
+  render();
 });
 
 function updateTimeScale(sliderValue) {
@@ -1390,8 +2035,10 @@ function setTimeZoomAnchor(event) {
   const scroller = event.target.closest(".time-scroll") || document.querySelector(".time-scroll");
   if (!scroller) return;
   const rect = scroller.getBoundingClientRect();
-  const x = Math.max(0, event.clientX - rect.left);
-  state.timeZoomAnchorRatio = rect.width > 0 ? x / rect.width : 0.5;
+  const width = Math.max(1, scroller.clientWidth - traceLabelColumnPx);
+  const x = Math.max(0, event.clientX - rect.left - traceLabelColumnPx);
+  state.timeZoomAnchorRatio = width > 0 ? x / width : 0.5;
+  state.timeZoomAnchorOffsetPx = x;
   state.timeZoomAnchorMs = Math.max(0, (scroller.scrollLeft + x) / timeGridWidthPx * state.timeScaleMs);
   state.timeRestoreAnchorMs = state.timeZoomAnchorMs;
   render();
@@ -1404,11 +2051,13 @@ function currentPositionScrollBytes() {
 }
 
 function setPositionZoomAnchor(event) {
-  const scroller = document.querySelector(".position-scroll");
+  const scroller = event.target.closest(".position-scroll") || document.querySelector(".position-scroll");
   if (!scroller) return;
   const rect = scroller.getBoundingClientRect();
-  const x = Math.max(0, event.clientX - rect.left);
-  state.positionZoomAnchorRatio = rect.width > 0 ? x / rect.width : 0.5;
+  const width = Math.max(1, scroller.clientWidth - traceLabelColumnPx);
+  const x = Math.max(0, event.clientX - rect.left - traceLabelColumnPx);
+  state.positionZoomAnchorRatio = width > 0 ? x / width : 0.5;
+  state.positionZoomAnchorOffsetPx = x;
   state.positionZoomAnchorBytes = Math.max(0, (scroller.scrollLeft + x) / positionGridWidthPx * state.positionScaleBytes);
   state.positionRestoreAnchorBytes = state.positionZoomAnchorBytes;
   render();
@@ -1427,6 +2076,8 @@ $("refreshButton").addEventListener("click", load);
 $("stopButton").addEventListener("click", () => post("/debug/analysis/stop"));
 $("startButton").addEventListener("click", () => {
   const maxRequestIds = Math.max(0, Number($("maxRequestIds").value || 10000));
+  state.samples = [];
+  state.selectedRequestKey = "";
   state.autoRefresh = true;
   $("autoRefresh").checked = true;
   scheduleAutoRefresh();
@@ -1451,10 +2102,10 @@ function scheduleAutoRefresh() {
     refreshTimer = null;
   }
   if (!state.autoRefresh) return;
-  refreshTimer = window.setTimeout(async () => {
+  refreshTimer = window.setTimeout(() => {
     refreshTimer = null;
-    await load();
     scheduleAutoRefresh();
+    load();
   }, state.refreshIntervalMs);
 }
 
