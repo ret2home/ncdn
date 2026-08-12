@@ -81,6 +81,13 @@ func startAnalysisServer(addr string, pops []analysisPop, staticDir string) {
 		}
 		writeAggregatorJSON(w, fanoutAnalysisPost(client, pops, "/debug/analysis/stop"))
 	})
+	mux.HandleFunc("/debug/cache/flush", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeAggregatorJSON(w, fanoutAnalysisPost(client, pops, "/debug/cache/flush"))
+	})
 	mux.HandleFunc("/debug/analysis", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)

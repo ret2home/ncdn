@@ -57,6 +57,7 @@ func main() {
 	mux.HandleFunc("/debug/analysis/start", cs.handleAnalysisStart)
 	mux.HandleFunc("/debug/analysis/stop", cs.handleAnalysisStop)
 	mux.HandleFunc("/debug/analysis", cs.handleAnalysisSnapshot)
+	mux.HandleFunc("/debug/cache/flush", cs.handleCacheFlush)
 	mux.Handle("/", cs)
 	/*mux.Handle("/", &httputil.ReverseProxy{
 		// FIXME: actually cache stuff...
