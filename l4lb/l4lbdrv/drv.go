@@ -29,6 +29,7 @@ type Config struct {
 	VIP6            netip.Addr
 	DestsIpIp6      DestinationEntries
 	DestsIp6Ip6     DestinationEntries
+	BalanceWeight   []int
 	HealthCheckDest string
 	SlotsLength     int
 }
@@ -105,21 +106,24 @@ func IPToUint32(ip netip.Addr) (uint32, error) {
 	return hostOrder.Uint32(ip4[:]), nil
 }
 
-func calcHash(serverID uint32, slotID uint32) uint64 {
-	var key [8]byte
+func calcHash(serverID uint32, slotID uint32, weightID uint32) uint64 {
+	var key [12]byte
 	binary.LittleEndian.PutUint32(key[0:4], slotID)
 	binary.LittleEndian.PutUint32(key[4:8], serverID)
+	binary.LittleEndian.PutUint32(key[8:12], weightID)
 	return xxhash.Sum64(key[:])
 }
-func selectPop(status []int, slotId uint32) uint32 {
+func selectPop(status []int, weights []int, slotId uint32) uint32 {
 	var maxId uint32 = 0
 	var maxHash uint64 = 0
 	for i := 1; i < len(status); i++ {
 		if status[i] >= 3 {
-			hs := calcHash(uint32(i), slotId)
-			if maxHash < hs {
-				maxHash = hs
-				maxId = uint32(i)
+			for j := 0; j < weights[i-1]; j++ {
+				hs := calcHash(uint32(i), slotId, uint32(j))
+				if maxHash < hs {
+					maxHash = hs
+					maxId = uint32(i)
+				}
 			}
 		}
 	}
@@ -164,9 +168,13 @@ func (lb *L4LB) Sync() error {
 		slotIds[i] = uint32(i)
 	}
 	destIdForSlots := make([]uint32, lb.cfg.SlotsLength)
+
+	counter := make([]uint32, len(lb.cfg.BalanceWeight))
 	for i := range destIdForSlots {
-		destIdForSlots[i] = selectPop(lb.backendStatus, uint32(i))
+		destIdForSlots[i] = selectPop(lb.backendStatus, lb.cfg.BalanceWeight, uint32(i))
+		counter[destIdForSlots[i]-1]++
 	}
+	fmt.Printf("balance counter: %v\n", counter)
 
 	fmt.Printf("changed! %v\n", lb.backendStatus)
 
