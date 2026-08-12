@@ -120,3 +120,19 @@ func (c *SieveCache) Release(entry *CacheEntry) {
 		}
 	}
 }
+
+func (c *SieveCache) FlushAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, entry := range c.cache {
+		entry.retired = true
+		if entry.counter == 0 {
+			os.Remove(entry.path)
+		}
+	}
+	c.cache = map[string]*CacheEntry{}
+	c.attr = map[string]*cacheattr{}
+	c.list = NewList()
+	c.size = 0
+}

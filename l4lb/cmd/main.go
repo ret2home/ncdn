@@ -24,6 +24,8 @@ var vip6 = flag.String("vip6", "fd6e:3de7:745b:0001:192:0:2:10", "VIP address to
 var dest_ipip6str = flag.String("dests_ipip6", "", "Comma separated list of destination IP and MAC addresses. (Example: 192.168.88.10;00:00:5e:00:53:01,)")
 var dest_ip6ip6str = flag.String("dests_ip6ip6", "", "Comma separated list of destination IP and MAC addresses. (Example: fd6e:3de7:745b:ffff:192:168:88:100;00:00:5e:00:53:01,)")
 var statusz = flag.String("statusz", ":8889/statusz", "health check dest")
+var analysisListenAddr = flag.String("analysisListenAddr", ":8891", "Analysis aggregator listen address")
+var analysisStaticDir = flag.String("analysisStaticDir", "static/analyzer", "Analysis Web UI static directory")
 
 func parseDest(deststr string) ([]l4lbdrv.DestinationEntry, error) {
 	commas := strings.Split(deststr, ",")
@@ -86,6 +88,10 @@ func main() {
 	}
 	slog.Info("L4LB started.")
 	defer lb.Close()
+
+	if *analysisListenAddr != "" {
+		go startAnalysisServer(*analysisListenAddr, analysisPopsFromDests(dests_ipip6, *statusz), *analysisStaticDir)
+	}
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
