@@ -42,4 +42,4 @@ echo ${dests_ipip6}
 echo ${dests_ip6ip6}
 
 sudo ip -n LB tunn del ipip0 || echo "no ipip0. good" # in case it exists from a `nolb.sh` run
-sudo ip netns exec LB ${BIN_DIR}/l4lb -xdpcapHookPath="" -dests_ipip6="${dests_ipip6}" -dests_ip6ip6="${dests_ip6ip6}"
+sudo ip netns exec LB ${BIN_DIR}/l4lb -xdpcapHookPath="" -dests_ipip6="${dests_ipip6}" -dests_ip6ip6="${dests_ip6ip6}" -weights="1,1"

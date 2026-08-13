@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,7 @@ var vip4 = flag.String("vip4", "192.0.2.10", "VIP address to load balance")
 var vip6 = flag.String("vip6", "fd6e:3de7:745b:0001:192:0:2:10", "VIP address to load balance")
 var dest_ipip6str = flag.String("dests_ipip6", "", "Comma separated list of destination IP and MAC addresses. (Example: 192.168.88.10;00:00:5e:00:53:01,)")
 var dest_ip6ip6str = flag.String("dests_ip6ip6", "", "Comma separated list of destination IP and MAC addresses. (Example: fd6e:3de7:745b:ffff:192:168:88:100;00:00:5e:00:53:01,)")
+var weights = flag.String("weights", "1,1", "load balancer weights")
 var statusz = flag.String("statusz", ":8889/statusz", "health check dest")
 var analysisListenAddr = flag.String("analysisListenAddr", ":8891", "Analysis aggregator listen address")
 var analysisStaticDir = flag.String("analysisStaticDir", "static/analyzer", "Analysis Web UI static directory")
@@ -58,6 +60,18 @@ func parseDest(deststr string) ([]l4lbdrv.DestinationEntry, error) {
 	log.Printf("dests: %+v", dests)
 	return dests, nil
 }
+func parseWeight(weightsStr string) ([]int, error) {
+	parsed := strings.Split(weightsStr, ",")
+	res := make([]int, len(parsed))
+	for i := range parsed {
+		v, err := strconv.Atoi(parsed[i])
+		if err != nil {
+			return make([]int, 0), err
+		}
+		res[i] = v
+	}
+	return res, nil
+}
 
 func main() {
 	flag.Parse()
@@ -70,6 +84,13 @@ func main() {
 	if err != nil {
 		slog.Error("Failed to parse dest string", slog.String("err", err.Error()))
 	}
+	weights, err := parseWeight(*weights)
+	if err != nil {
+		slog.Error("Failed to parse weight string", slog.String("err", err.Error()))
+	}
+	if len(dests_ipip6) != len(weights)+1 {
+		slog.Error("length doesn't match")
+	}
 
 	cfg := &l4lbdrv.Config{
 		BinPath:         *lbBin,
@@ -79,6 +100,7 @@ func main() {
 		VIP6:            netip.MustParseAddr(*vip6),
 		DestsIpIp6:      dests_ipip6,
 		DestsIp6Ip6:     dests_ip6ip6,
+		BalanceWeight:   weights,
 		HealthCheckDest: *statusz,
 		SlotsLength:     4096,
 	}
